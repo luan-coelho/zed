@@ -1,4 +1,5 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
+use std::path::Path;
 use std::process::Command;
 
 fn main() {
@@ -202,18 +203,8 @@ fn main() {
             }
         }
 
-        let release_channel = option_env!("RELEASE_CHANNEL").unwrap_or("dev");
-        let icon = match release_channel {
-            "stable" => "resources/windows/app-icon.ico",
-            "preview" => "resources/windows/app-icon-preview.ico",
-            "nightly" => "resources/windows/app-icon-nightly.ico",
-            "dev" => "resources/windows/app-icon-dev.ico",
-            _ => "resources/windows/app-icon-dev.ico",
-        };
-        let icon = std::path::Path::new(icon);
-
         println!("cargo:rerun-if-env-changed=RELEASE_CHANNEL");
-        println!("cargo:rerun-if-changed={}", icon.display());
+        println!("cargo:rerun-if-changed={}", icon_path().display());
 
         #[cfg(windows)]
         {
@@ -225,7 +216,7 @@ fn main() {
             if let Some(explicit_rc_toolkit_path) = std::env::var("ZED_RC_TOOLKIT_PATH").ok() {
                 res.set_toolkit_path(explicit_rc_toolkit_path.as_str());
             }
-            res.set_icon(icon.to_str().unwrap());
+            res.set_icon(icon_path().to_str().unwrap());
             res.set("FileDescription", "Zed");
             res.set("ProductName", "Zed");
 
@@ -235,4 +226,53 @@ fn main() {
             }
         }
     }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    prepare_app_icon_x11();
+}
+
+fn icon_path() -> &'static Path {
+    let release_channel = option_env!("RELEASE_CHANNEL").unwrap_or("dev");
+    let icon = match release_channel {
+        "stable" => "resources/app-icon.png",
+        "preview" => "resources/app-icon-preview.png",
+        "nightly" => "resources/app-icon-nightly.png",
+        "dev" | _ => "resources/app-icon-dev.png",
+    };
+
+    Path::new(icon)
+}
+
+fn prepare_app_icon_x11() {
+    use image::{DynamicImage, ImageReader, ImageResult, imageops};
+    use std::env;
+    use std::path::Path;
+
+    let out_dir = env::var("OUT_DIR").unwrap();
+
+    let resized_image =
+        match || -> ImageResult<DynamicImage> { Ok(ImageReader::open(icon_path())?.decode()?) }() {
+            Err(msg) => {
+                eprintln!("failed to read or decode {}: {msg}", icon_path().display());
+                std::process::exit(1);
+            }
+            Ok(image) => imageops::resize(&image, 256, 256, imageops::FilterType::Lanczos3),
+        };
+
+    // name should match include_bytes! call in src/zed.rs
+    let icon_out_path = Path::new(&out_dir).join("app_icon.png");
+    resized_image.save(&icon_out_path).expect("saving app icon");
+
+    // verify icon can be read and decoded
+    if let Err(msg) = ImageReader::open(&icon_out_path).unwrap().decode() {
+        eprintln!(
+            "error verifying {}: {msg} (resized from {})",
+            icon_out_path.display(),
+            icon_path().display(),
+        );
+        std::process::exit(1);
+    }
+
+    println!("cargo:rerun-if-env-changed=RELEASE_CHANNEL");
+    println!("cargo:rerun-if-changed={}", icon_path().to_string_lossy());
 }
