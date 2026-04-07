@@ -20,8 +20,6 @@ impl ReplicaId {
     pub const REMOTE_SERVER: ReplicaId = ReplicaId(1);
     /// The agent's unique identifier.
     pub const AGENT: ReplicaId = ReplicaId(2);
-    /// A local branch.
-    pub const LOCAL_BRANCH: ReplicaId = ReplicaId(3);
     /// The first collaborative replica ID, any replica equal or greater than this is a collaborative replica.
     pub const FIRST_COLLAB_ID: ReplicaId = ReplicaId(8);
 
@@ -46,8 +44,6 @@ impl fmt::Debug for ReplicaId {
             write!(f, "<remote>")
         } else if *self == ReplicaId::AGENT {
             write!(f, "<agent>")
-        } else if *self == ReplicaId::LOCAL_BRANCH {
-            write!(f, "<branch>")
         } else {
             write!(f, "{}", self.0)
         }

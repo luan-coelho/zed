@@ -1862,8 +1862,11 @@ impl BufferSnapshot {
         S: ToOffset,
         T: Into<Arc<str>>,
     {
-        let mut lamport_clock = clock::Lamport::new(ReplicaId::LOCAL_BRANCH);
-        let timestamp = lamport_clock.tick();
+        let mut timestamp = clock::Lamport {
+            replica_id: self.replica_id,
+            value: self.version.get(self.replica_id),
+        };
+        let timestamp = timestamp.tick();
         let edits: Vec<_> = edits
             .into_iter()
             .map(|(range, new_text)| (range.to_offset(self), new_text.into()))
