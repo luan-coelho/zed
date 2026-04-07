@@ -243,6 +243,7 @@ fn icon_path() -> &'static Path {
     Path::new(icon)
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn prepare_app_icon_x11() {
     use image::{DynamicImage, ImageReader, ImageResult, imageops};
     use std::env;
