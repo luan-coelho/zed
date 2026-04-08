@@ -1,4 +1,4 @@
-use super::query_executor::split_sql_statements;
+use super::query_executor::{is_connection_error, split_sql_statements};
 
 #[test]
 fn test_single_statement() {
@@ -170,4 +170,86 @@ fn test_complex_real_world_query() {
     assert!(stmts[0].starts_with("-- Create users table"));
     assert!(stmts[1].starts_with("-- Insert sample data"));
     assert!(stmts[2].starts_with("-- Query with subquery"));
+}
+
+// ── is_connection_error tests ──────────────────────────────────────
+
+#[test]
+fn test_connection_refused_is_connection_error() {
+    assert!(is_connection_error("connection refused"));
+}
+
+#[test]
+fn test_connection_reset_is_connection_error() {
+    assert!(is_connection_error("connection reset by peer"));
+}
+
+#[test]
+fn test_broken_pipe_is_connection_error() {
+    assert!(is_connection_error("broken pipe"));
+}
+
+#[test]
+fn test_pool_timed_out_is_connection_error() {
+    assert!(is_connection_error("pool timed out while waiting for an open connection"));
+}
+
+#[test]
+fn test_connection_closed_is_connection_error() {
+    assert!(is_connection_error("connection closed before message completed"));
+}
+
+#[test]
+fn test_server_closed_is_connection_error() {
+    assert!(is_connection_error("server closed the connection unexpectedly"));
+}
+
+#[test]
+fn test_connection_timed_out_is_connection_error() {
+    assert!(is_connection_error("connection timed out"));
+}
+
+#[test]
+fn test_connection_terminated_is_connection_error() {
+    assert!(is_connection_error("connection terminated"));
+}
+
+#[test]
+fn test_no_connection_is_connection_error() {
+    assert!(is_connection_error("no connection to the server"));
+}
+
+#[test]
+fn test_case_insensitive_connection_refused() {
+    assert!(is_connection_error("Connection Refused"));
+}
+
+#[test]
+fn test_case_insensitive_broken_pipe() {
+    assert!(is_connection_error("BROKEN PIPE"));
+}
+
+#[test]
+fn test_relation_does_not_exist_is_not_connection_error() {
+    assert!(!is_connection_error("relation \"users\" does not exist"));
+}
+
+#[test]
+fn test_syntax_error_is_not_connection_error() {
+    assert!(!is_connection_error("syntax error at or near \"SELEC\""));
+}
+
+#[test]
+fn test_permission_denied_is_not_connection_error() {
+    assert!(!is_connection_error("permission denied for table users"));
+}
+
+#[test]
+fn test_empty_string_is_not_connection_error() {
+    assert!(!is_connection_error(""));
+}
+
+#[test]
+fn test_generic_error_is_not_connection_error() {
+    assert!(!is_connection_error("something went wrong"));
 }

@@ -174,4 +174,8 @@ pub trait DatabaseProvider: Send + Sync {
     async fn has_active_transaction(&self, _url: &str) -> bool {
         false
     }
+
+    async fn is_connection_alive(&self, url: &str) -> bool {
+        self.test_connection(url).await.is_ok()
+    }
 }

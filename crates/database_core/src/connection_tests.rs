@@ -363,3 +363,24 @@ fn test_capabilities_different_connections_different_caps() {
     assert!(!my_caps.create_role);
     assert!(!lite_caps.create_database);
 }
+
+// ── check_connection_health tests ──────────────────────────────────
+
+#[tokio::test]
+async fn test_check_connection_health_returns_false_when_no_config() {
+    let mut mgr = ConnectionManager::new();
+    let result = mgr.check_connection_health().await;
+    assert!(result.is_ok());
+    assert!(!result.expect("expected Ok"));
+}
+
+#[tokio::test]
+async fn test_check_connection_health_returns_false_when_no_active_connection() {
+    let config = make_config(vec![("pg", "postgres", "mydb")]);
+    let mut mgr = ConnectionManager::new();
+    mgr.load_config(config);
+    mgr.set_active_connection("nonexistent");
+    let result = mgr.check_connection_health().await;
+    assert!(result.is_ok());
+    assert!(!result.expect("expected Ok"));
+}

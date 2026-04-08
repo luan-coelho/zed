@@ -6,9 +6,9 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription,
     WeakEntity, Window,
 };
-use ui::ContextMenu;
 use theme::ActiveTheme;
-use ui::{prelude::*, Tooltip};
+use ui::ContextMenu;
+use ui::{prelude::*, TintColor, Tooltip};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::Workspace;
 
@@ -62,6 +62,65 @@ pub(crate) fn format_as_json(columns: &[String], rows: &[Vec<String>]) -> Option
     serde_json::to_string_pretty(&json_rows).ok()
 }
 
+pub(crate) fn generate_update_sql(
+    table_query: &str,
+    columns: &[String],
+    row: &[String],
+    col_index: usize,
+    new_value: &str,
+) -> Option<String> {
+    let table_name = extract_table_name(table_query)?;
+    let col_name = columns.get(col_index)?;
+
+    let pk_col_index = columns
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case("id"))
+        .unwrap_or(0);
+    let pk_col = columns.get(pk_col_index)?;
+    let pk_value = row.get(pk_col_index)?;
+
+    let set_clause = if new_value.eq_ignore_ascii_case("NULL") {
+        format!("\"{}\" = NULL", col_name)
+    } else {
+        format!(
+            "\"{}\" = '{}'",
+            col_name,
+            new_value.replace('\'', "''")
+        )
+    };
+
+    let where_clause = if pk_value.eq_ignore_ascii_case("NULL") {
+        format!("\"{}\" IS NULL", pk_col)
+    } else {
+        format!(
+            "\"{}\" = '{}'",
+            pk_col,
+            pk_value.replace('\'', "''")
+        )
+    };
+
+    Some(format!(
+        "UPDATE {} SET {} WHERE {};",
+        table_name, set_clause, where_clause
+    ))
+}
+
+fn extract_table_name(query: &str) -> Option<String> {
+    let upper = query.to_uppercase();
+    let from_pos = upper.find("FROM")?;
+    let after_from = &query[from_pos + 4..];
+    let trimmed = after_from.trim_start();
+    let table_name: String = trimmed
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != ';')
+        .collect();
+    if table_name.is_empty() {
+        None
+    } else {
+        Some(table_name)
+    }
+}
+
 actions!(database_result_panel, [ToggleFocus,]);
 
 
@@ -93,6 +152,9 @@ pub struct DatabaseResultPanel {
     filter_text: String,
     filter_editor: Entity<Editor>,
     tab_context_menu: Option<(Entity<ContextMenu>, Subscription)>,
+    editing_cell: Option<(usize, usize)>,
+    cell_editor: Entity<Editor>,
+    pending_updates: Vec<String>,
 }
 
 struct QueryResultEntry {
@@ -129,6 +191,8 @@ impl DatabaseResultPanel {
         })
         .detach();
 
+        let cell_editor = cx.new(|cx| Editor::single_line(window, cx));
+
         Self {
             focus_handle,
             results: Vec::new(),
@@ -141,6 +205,9 @@ impl DatabaseResultPanel {
             filter_text: String::new(),
             filter_editor,
             tab_context_menu: None,
+            editing_cell: None,
+            cell_editor,
+            pending_updates: Vec::new(),
         }
     }
 
@@ -222,6 +289,96 @@ impl DatabaseResultPanel {
             ResultView::Table(idx) => self.results.get(idx).map(|e| &e.result),
             ResultView::Output | ResultView::History => None,
         }
+    }
+
+    fn start_editing_cell(
+        &mut self,
+        row: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active_idx = match self.active_view {
+            ResultView::Table(idx) => idx,
+            _ => return,
+        };
+        let value = self
+            .results
+            .get(active_idx)
+            .and_then(|entry| entry.result.rows.get(row))
+            .and_then(|r| r.get(col))
+            .cloned()
+            .unwrap_or_default();
+
+        self.editing_cell = Some((row, col));
+        self.cell_editor.update(cx, |editor, cx| {
+            editor.set_text(value, window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+        });
+        self.cell_editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn commit_cell_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, col)) = self.editing_cell.take() else {
+            return;
+        };
+        let active_idx = match self.active_view {
+            ResultView::Table(idx) => idx,
+            _ => return,
+        };
+        let new_value = self.cell_editor.read(cx).text(cx);
+
+        let Some(entry) = self.results.get_mut(active_idx) else {
+            return;
+        };
+        let old_value = entry
+            .result
+            .rows
+            .get(row)
+            .and_then(|r| r.get(col))
+            .cloned()
+            .unwrap_or_default();
+
+        if new_value == old_value {
+            cx.notify();
+            return;
+        }
+
+        let columns = &entry.result.columns;
+        let row_data = entry.result.rows.get(row);
+        if let Some(sql) = row_data.and_then(|r| {
+            generate_update_sql(&entry.query, columns, r, col, &new_value)
+        }) {
+            let now = chrono::Local::now().format("%H:%M:%S").to_string();
+            self.output_log
+                .push(format!("[{now}] PENDING: {sql}"));
+            self.pending_updates.push(sql);
+        }
+
+        if let Some(row_data) = entry.result.rows.get_mut(row) {
+            if let Some(cell) = row_data.get_mut(col) {
+                *cell = new_value;
+            }
+        }
+
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_cell_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_cell = None;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn discard_pending_updates(&mut self, cx: &mut Context<Self>) {
+        let count = self.pending_updates.len();
+        self.pending_updates.clear();
+        let now = chrono::Local::now().format("%H:%M:%S").to_string();
+        self.output_log
+            .push(format!("[{now}] Discarded {count} pending update(s)"));
+        cx.notify();
     }
 
     fn copy_active_result_as_tsv(&self, cx: &mut Context<Self>) {
@@ -938,6 +1095,9 @@ impl DatabaseResultPanel {
                 let columns = result.columns.clone();
                 let alt_bg = cx.theme().colors().ghost_element_hover;
                 let selected_bg = cx.theme().colors().ghost_element_selected;
+                let editing_cell = self.editing_cell;
+                let cell_editor = self.cell_editor.clone();
+                let weak_self = cx.entity().downgrade();
 
                 gpui::uniform_list(
                     "result-rows",
@@ -971,50 +1131,67 @@ impl DatabaseResultPanel {
                                 );
 
                                 for (col_idx, val) in page_rows[ix].iter().enumerate() {
-                                    let is_null = val == "NULL";
-                                    let is_error = columns
-                                        .first()
-                                        .map(|c| c == "Error")
-                                        .unwrap_or(false)
-                                        && col_idx == 0;
+                                    let is_editing = editing_cell == Some((global_ix, col_idx));
 
-                                    let val_clone = val.clone();
-                                    row = row.child(
-                                        div()
-                                            .id(ElementId::Name(
-                                                format!("cell-{global_ix}-{col_idx}").into(),
-                                            ))
-                                            .w(col_width)
-                                            .flex_shrink_0()
-                                            .px_2()
-                                            .py_px()
-                                            .overflow_hidden()
-                                            .cursor_pointer()
-                                            .hover(|d| d.bg(alt_bg))
-                                            .tooltip({
-                                                let v = val_clone.clone();
-                                                move |_w, cx| Tooltip::simple(v.clone(), cx)
-                                            })
-                                            .on_click({
-                                                let v = val_clone.clone();
-                                                move |_, _w, cx| {
-                                                    cx.write_to_clipboard(
-                                                        gpui::ClipboardItem::new_string(v.clone()),
-                                                    );
-                                                }
-                                            })
-                                            .child(
-                                                Label::new(val.clone())
-                                                    .size(LabelSize::XSmall)
-                                                    .color(if is_error {
-                                                        Color::Error
-                                                    } else if is_null {
-                                                        Color::Muted
-                                                    } else {
-                                                        Color::Default
-                                                    }),
-                                            ),
-                                    );
+                                    if is_editing {
+                                        row = row.child(
+                                            div()
+                                                .w(col_width)
+                                                .flex_shrink_0()
+                                                .px_1()
+                                                .py_px()
+                                                .child(cell_editor.clone()),
+                                        );
+                                    } else {
+                                        let is_null = val == "NULL";
+                                        let is_error = columns
+                                            .first()
+                                            .map(|c| c == "Error")
+                                            .unwrap_or(false)
+                                            && col_idx == 0;
+
+                                        let val_clone = val.clone();
+                                        let weak = weak_self.clone();
+                                        row = row.child(
+                                            div()
+                                                .id(ElementId::Name(
+                                                    format!("cell-{global_ix}-{col_idx}").into(),
+                                                ))
+                                                .w(col_width)
+                                                .flex_shrink_0()
+                                                .px_2()
+                                                .py_px()
+                                                .overflow_hidden()
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(alt_bg))
+                                                .tooltip({
+                                                    let v = val_clone.clone();
+                                                    move |_w, cx| Tooltip::simple(v.clone(), cx)
+                                                })
+                                                .on_click({
+                                                    move |_, window, cx| {
+                                                        if let Some(panel) = weak.upgrade() {
+                                                            panel.update(cx, |this, cx| {
+                                                                this.start_editing_cell(
+                                                                    global_ix, col_idx, window, cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    }
+                                                })
+                                                .child(
+                                                    Label::new(val.clone())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(if is_error {
+                                                            Color::Error
+                                                        } else if is_null {
+                                                            Color::Muted
+                                                        } else {
+                                                            Color::Default
+                                                        }),
+                                                ),
+                                        );
+                                    }
                                 }
                                 row.into_any_element()
                             })
@@ -1188,6 +1365,76 @@ impl DatabaseResultPanel {
                             ),
                     ),
             )
+            .when(!self.pending_updates.is_empty(), |d| {
+                let count = self.pending_updates.len();
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_2()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().title_bar_background)
+                        .child(
+                            Label::new(format!(
+                                "{} pending change{}",
+                                count,
+                                if count == 1 { "" } else { "s" }
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new("apply-updates", "Apply")
+                                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                                        .label_size(LabelSize::XSmall)
+                                        .tooltip(|_w, cx| {
+                                            Tooltip::simple(
+                                                "Copy all pending UPDATE statements to clipboard",
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(cx.listener(|this, _, _w, cx| {
+                                            let sql =
+                                                this.pending_updates.join("\n");
+                                            cx.write_to_clipboard(
+                                                gpui::ClipboardItem::new_string(sql),
+                                            );
+                                            let count = this.pending_updates.len();
+                                            this.pending_updates.clear();
+                                            let now = chrono::Local::now()
+                                                .format("%H:%M:%S")
+                                                .to_string();
+                                            this.output_log.push(format!(
+                                                "[{now}] Copied {count} UPDATE statement(s) to clipboard"
+                                            ));
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("discard-updates", "Discard")
+                                        .style(ButtonStyle::Subtle)
+                                        .label_size(LabelSize::XSmall)
+                                        .tooltip(|_w, cx| {
+                                            Tooltip::simple(
+                                                "Discard all pending changes",
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(cx.listener(|this, _, _w, cx| {
+                                            this.discard_pending_updates(cx);
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -1273,6 +1520,16 @@ impl Render for DatabaseResultPanel {
             .flex_col()
             .size_full()
             .bg(cx.theme().colors().panel_background)
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                if this.editing_cell.is_some() {
+                    this.commit_cell_edit(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                if this.editing_cell.is_some() {
+                    this.cancel_cell_edit(window, cx);
+                }
+            }))
             // Tab bar
             .child(
                 div()
@@ -1320,5 +1577,153 @@ impl Render for DatabaseResultPanel {
                     .with_priority(1),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_update_sql_basic() {
+        let columns = vec!["id".to_string(), "name".to_string(), "email".to_string()];
+        let row = vec![
+            "1".to_string(),
+            "Alice".to_string(),
+            "alice@example.com".to_string(),
+        ];
+        let result = generate_update_sql(
+            "SELECT * FROM users LIMIT 100",
+            &columns,
+            &row,
+            1,
+            "Bob",
+        );
+        assert_eq!(
+            result,
+            Some("UPDATE users SET \"name\" = 'Bob' WHERE \"id\" = '1';".to_string())
+        );
+    }
+
+    #[test]
+    fn test_generate_update_sql_with_schema() {
+        let columns = vec!["id".to_string(), "value".to_string()];
+        let row = vec!["42".to_string(), "old".to_string()];
+        let result = generate_update_sql(
+            "SELECT * FROM public.settings LIMIT 50",
+            &columns,
+            &row,
+            1,
+            "new",
+        );
+        assert_eq!(
+            result,
+            Some("UPDATE public.settings SET \"value\" = 'new' WHERE \"id\" = '42';".to_string())
+        );
+    }
+
+    #[test]
+    fn test_generate_update_sql_null_value() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let row = vec!["1".to_string(), "Alice".to_string()];
+        let result = generate_update_sql(
+            "SELECT * FROM users LIMIT 100",
+            &columns,
+            &row,
+            1,
+            "NULL",
+        );
+        assert_eq!(
+            result,
+            Some("UPDATE users SET \"name\" = NULL WHERE \"id\" = '1';".to_string())
+        );
+    }
+
+    #[test]
+    fn test_generate_update_sql_escapes_single_quotes() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let row = vec!["1".to_string(), "Alice".to_string()];
+        let result = generate_update_sql(
+            "SELECT * FROM users LIMIT 100",
+            &columns,
+            &row,
+            1,
+            "O'Brien",
+        );
+        assert_eq!(
+            result,
+            Some("UPDATE users SET \"name\" = 'O''Brien' WHERE \"id\" = '1';".to_string())
+        );
+    }
+
+    #[test]
+    fn test_generate_update_sql_no_from_clause() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let row = vec!["1".to_string(), "Alice".to_string()];
+        let result = generate_update_sql("SHOW TABLES", &columns, &row, 1, "Bob");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_generate_update_sql_uses_first_column_as_pk_when_no_id() {
+        let columns = vec!["user_id".to_string(), "name".to_string()];
+        let row = vec!["99".to_string(), "Alice".to_string()];
+        let result = generate_update_sql(
+            "SELECT * FROM users LIMIT 100",
+            &columns,
+            &row,
+            1,
+            "Bob",
+        );
+        assert_eq!(
+            result,
+            Some("UPDATE users SET \"name\" = 'Bob' WHERE \"user_id\" = '99';".to_string())
+        );
+    }
+
+    #[test]
+    fn test_generate_update_sql_null_pk() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let row = vec!["NULL".to_string(), "Alice".to_string()];
+        let result = generate_update_sql(
+            "SELECT * FROM users LIMIT 100",
+            &columns,
+            &row,
+            1,
+            "Bob",
+        );
+        assert_eq!(
+            result,
+            Some("UPDATE users SET \"name\" = 'Bob' WHERE \"id\" IS NULL;".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_table_name_simple() {
+        assert_eq!(
+            extract_table_name("SELECT * FROM users LIMIT 100"),
+            Some("users".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_table_name_with_schema() {
+        assert_eq!(
+            extract_table_name("SELECT * FROM public.users LIMIT 100"),
+            Some("public.users".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_table_name_lowercase_from() {
+        assert_eq!(
+            extract_table_name("select * from my_table where id = 1"),
+            Some("my_table".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_table_name_no_from() {
+        assert_eq!(extract_table_name("SHOW TABLES"), None);
     }
 }

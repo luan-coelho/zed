@@ -4567,6 +4567,7 @@ dependencies = [
  "gpui_tokio",
  "language",
  "lsp",
+ "menu",
  "multi_buffer",
  "project",
  "serde_json",

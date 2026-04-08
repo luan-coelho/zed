@@ -287,4 +287,11 @@ impl ConnectionManager {
             Err(_) => false,
         }
     }
+
+    pub async fn check_connection_health(&mut self) -> Result<bool> {
+        match self.active_context() {
+            Ok(ctx) => Ok(ctx.provider.is_connection_alive(&ctx.url).await),
+            Err(_) => Ok(false),
+        }
+    }
 }

@@ -392,67 +392,34 @@ impl DatabasePanel {
                     break;
                 }
 
-                let conn_mgr = conn_manager.clone();
-                let stmt_clone = stmt.clone();
-                let db = database.clone();
-                let sch = effective_schema.clone();
-                let iso = isolation;
+                let tx_cmd = detect_transaction_command(stmt);
 
-                let tx_cmd = detect_transaction_command(&stmt_clone);
+                let result = Self::execute_statement(
+                    &conn_manager, stmt, &database, &effective_schema, isolation, tx_mode, tx_cmd, cx,
+                ).await;
 
-                let result = Tokio::spawn_result(cx, async move {
-                    let mut mgr = conn_mgr.write().await;
+                // If this is a connection error, try reconnecting once and retrying
+                let result = match &result {
+                    Err(e) if is_connection_error(&format!("{e:#}")) => {
+                        let conn_mgr_retry = conn_manager.clone();
+                        let reconnect_ok = Tokio::spawn_result(cx, async move {
+                            let mut mgr = conn_mgr_retry.write().await;
+                            mgr.test_connection().await
+                        })
+                        .await
+                        .is_ok();
 
-                    match tx_cmd {
-                        Some(TransactionCommand::Begin) => {
-                            mgr.begin_transaction(iso.as_sql()).await?;
-                            Ok(database_core::QueryResult {
-                                columns: vec!["status".to_string()],
-                                rows: vec![vec!["BEGIN".to_string()]],
-                                rows_affected: 0,
-                                execution_time_ms: 0,
-                            })
-                        }
-                        Some(TransactionCommand::Commit) => {
-                            mgr.commit_transaction().await?;
-                            Ok(database_core::QueryResult {
-                                columns: vec!["status".to_string()],
-                                rows: vec![vec!["COMMIT".to_string()]],
-                                rows_affected: 0,
-                                execution_time_ms: 0,
-                            })
-                        }
-                        Some(TransactionCommand::Rollback) => {
-                            mgr.rollback_transaction().await?;
-                            Ok(database_core::QueryResult {
-                                columns: vec!["status".to_string()],
-                                rows: vec![vec!["ROLLBACK".to_string()]],
-                                rows_affected: 0,
-                                execution_time_ms: 0,
-                            })
-                        }
-                        None => {
-                            let in_tx = mgr.has_active_transaction().await;
-
-                            if in_tx {
-                                mgr.execute_in_transaction(&stmt_clone).await
-                            } else if matches!(tx_mode, crate::database_panel::TransactionMode::Manual) {
-                                mgr.begin_transaction(iso.as_sql()).await?;
-                                mgr.execute_in_transaction(&stmt_clone).await
-                            } else {
-                                match db {
-                                    Some(ref db) => {
-                                        mgr.execute_query_in_database(&stmt_clone, db, sch.as_deref()).await
-                                    }
-                                    None => {
-                                        mgr.execute_query_in_schema(&stmt_clone, sch.as_deref()).await
-                                    }
-                                }
-                            }
+                        if reconnect_ok {
+                            let retry_tx_cmd = detect_transaction_command(stmt);
+                            Self::execute_statement(
+                                &conn_manager, stmt, &database, &effective_schema, isolation, tx_mode, retry_tx_cmd, cx,
+                            ).await
+                        } else {
+                            result
                         }
                     }
-                })
-                .await;
+                    _ => result,
+                };
 
                 let query_result = match result {
                     Ok(qr) => qr,
@@ -676,6 +643,76 @@ impl DatabasePanel {
         Ok(active_schema)
     }
 
+    async fn execute_statement(
+        conn_manager: &Arc<RwLock<ConnectionManager>>,
+        stmt: &str,
+        database: &Option<String>,
+        schema: &Option<String>,
+        isolation: crate::database_panel::IsolationLevel,
+        tx_mode: crate::database_panel::TransactionMode,
+        tx_cmd: Option<TransactionCommand>,
+        cx: &mut AsyncWindowContext,
+    ) -> anyhow::Result<database_core::QueryResult> {
+        let conn_mgr = conn_manager.clone();
+        let stmt_owned = stmt.to_string();
+        let db = database.clone();
+        let sch = schema.clone();
+
+        Tokio::spawn_result(cx, async move {
+            let mut mgr = conn_mgr.write().await;
+
+            match tx_cmd {
+                Some(TransactionCommand::Begin) => {
+                    mgr.begin_transaction(isolation.as_sql()).await?;
+                    Ok(database_core::QueryResult {
+                        columns: vec!["status".to_string()],
+                        rows: vec![vec!["BEGIN".to_string()]],
+                        rows_affected: 0,
+                        execution_time_ms: 0,
+                    })
+                }
+                Some(TransactionCommand::Commit) => {
+                    mgr.commit_transaction().await?;
+                    Ok(database_core::QueryResult {
+                        columns: vec!["status".to_string()],
+                        rows: vec![vec!["COMMIT".to_string()]],
+                        rows_affected: 0,
+                        execution_time_ms: 0,
+                    })
+                }
+                Some(TransactionCommand::Rollback) => {
+                    mgr.rollback_transaction().await?;
+                    Ok(database_core::QueryResult {
+                        columns: vec!["status".to_string()],
+                        rows: vec![vec!["ROLLBACK".to_string()]],
+                        rows_affected: 0,
+                        execution_time_ms: 0,
+                    })
+                }
+                None => {
+                    let in_tx = mgr.has_active_transaction().await;
+
+                    if in_tx {
+                        mgr.execute_in_transaction(&stmt_owned).await
+                    } else if matches!(tx_mode, crate::database_panel::TransactionMode::Manual) {
+                        mgr.begin_transaction(isolation.as_sql()).await?;
+                        mgr.execute_in_transaction(&stmt_owned).await
+                    } else {
+                        match db {
+                            Some(ref db) => {
+                                mgr.execute_query_in_database(&stmt_owned, db, sch.as_deref()).await
+                            }
+                            None => {
+                                mgr.execute_query_in_schema(&stmt_owned, sch.as_deref()).await
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     /// Push a query result to the result panel.
     pub(crate) fn push_query_result(
         weak_workspace: &WeakEntity<Workspace>,
@@ -729,6 +766,19 @@ fn detect_transaction_command(sql: &str) -> Option<TransactionCommand> {
     } else {
         None
     }
+}
+
+pub(crate) fn is_connection_error(error_msg: &str) -> bool {
+    let lower = error_msg.to_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("broken pipe")
+        || lower.contains("no connection")
+        || lower.contains("server closed")
+        || lower.contains("connection timed out")
+        || lower.contains("pool timed out")
+        || lower.contains("connection terminated")
 }
 
 pub(crate) fn split_sql_statements(sql: &str) -> Vec<String> {
