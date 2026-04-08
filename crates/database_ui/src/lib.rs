@@ -5,6 +5,11 @@ pub mod sql_completion;
 mod sql_diagnostics;
 pub mod sql_toolbar;
 
+#[cfg(test)]
+mod sql_completion_tests;
+#[cfg(test)]
+mod sql_diagnostics_tests;
+
 pub use database_panel::DatabasePanel;
 pub use result_panel::DatabaseResultPanel;
 

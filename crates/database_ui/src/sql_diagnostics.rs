@@ -64,7 +64,7 @@ pub fn update_sql_diagnostics(buffer: &Entity<Buffer>, cx: &mut gpui::App) {
 }
 
 /// Extract error message and approximate location from sqlparser error.
-fn parse_error_location(err: &sqlparser::parser::ParserError, _text: &str) -> (String, u32, u32) {
+pub(crate) fn parse_error_location(err: &sqlparser::parser::ParserError, _text: &str) -> (String, u32, u32) {
     let msg = err.to_string();
 
     // sqlparser errors look like:

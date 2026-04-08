@@ -284,7 +284,7 @@ fn make_completion(
 }
 
 #[derive(Debug)]
-enum SqlContext {
+pub(crate) enum SqlContext {
     AfterFrom,
     AfterJoin,
     AfterUpdate,
@@ -293,7 +293,7 @@ enum SqlContext {
     General,
 }
 
-fn detect_sql_context(text: &str, offset: usize) -> SqlContext {
+pub(crate) fn detect_sql_context(text: &str, offset: usize) -> SqlContext {
     let before = &text[..offset];
 
     // Check if we're after a dot (table.column or alias.column)
@@ -331,7 +331,7 @@ fn detect_sql_context(text: &str, offset: usize) -> SqlContext {
 /// Detects patterns: `FROM table alias`, `FROM table AS alias`,
 /// `JOIN table alias ON`, `JOIN table AS alias ON`, etc.
 /// Returns a map of alias → table_name (both lowercase).
-fn parse_aliases(text: &str) -> std::collections::HashMap<String, String> {
+pub(crate) fn parse_aliases(text: &str) -> std::collections::HashMap<String, String> {
     let mut aliases = std::collections::HashMap::new();
 
     // Tokenize preserving original case for table names
@@ -414,7 +414,7 @@ fn parse_aliases(text: &str) -> std::collections::HashMap<String, String> {
     aliases
 }
 
-fn is_sql_keyword(word: &str) -> bool {
+pub(crate) fn is_sql_keyword(word: &str) -> bool {
     [
         "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "EXISTS", "INSERT", "INTO",
         "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "ALTER", "DROP", "JOIN", "INNER",
@@ -427,7 +427,7 @@ fn is_sql_keyword(word: &str) -> bool {
     .contains(&word)
 }
 
-fn extract_word_before_cursor(text: &str, offset: usize) -> String {
+pub(crate) fn extract_word_before_cursor(text: &str, offset: usize) -> String {
     let before = &text[..offset];
     let start = before
         .rfind(|c: char| !c.is_alphanumeric() && c != '_')
