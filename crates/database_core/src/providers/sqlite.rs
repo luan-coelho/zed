@@ -4,49 +4,67 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Column as _, Row, SqlitePool};
-use tokio::sync::RwLock;
 
-use crate::provider::DatabaseProvider;
+use super::PoolManager;
+use crate::provider::{
+    is_read_query, DatabaseProvider, FormPlaceholders, ProviderCapabilities, ProviderMetadata,
+};
 use crate::schema::*;
 
 pub struct SqliteProvider {
-    pool: RwLock<Option<(String, SqlitePool)>>,
+    pools: PoolManager<SqlitePool>,
 }
 
 impl SqliteProvider {
     pub fn new() -> Self {
         Self {
-            pool: RwLock::new(None),
+            pools: PoolManager::new(),
         }
     }
 
     async fn ensure_pool(&self, url: &str) -> Result<SqlitePool> {
-        {
-            let guard = self.pool.read().await;
-            if let Some((cached_url, pool)) = guard.as_ref() {
-                if cached_url == url && !pool.is_closed() {
-                    return Ok(pool.clone());
-                }
-            }
-        }
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(std::time::Duration::from_secs(10))
-            .connect(url)
+        self.pools
+            .get_or_create(url, |url| async move {
+                SqlitePoolOptions::new()
+                    .max_connections(5)
+                    .acquire_timeout(std::time::Duration::from_secs(10))
+                    .connect(&url)
+                    .await
+                    .context("failed to connect to SQLite")
+            })
             .await
-            .context("failed to connect to SQLite")?;
+    }
+}
 
-        let mut guard = self.pool.write().await;
-        *guard = Some((url.to_string(), pool.clone()));
-        Ok(pool)
+impl ProviderMetadata for SqliteProvider {
+    fn id(&self) -> &'static str { "sqlite" }
+    fn display_name(&self) -> &'static str { "SQLite" }
+    fn default_port(&self) -> u16 { 0 }
+    fn default_user(&self) -> &'static str { "" }
+    fn url_scheme(&self) -> &'static str { "sqlite" }
+    fn aliases(&self) -> &'static [&'static str] { &["sqlite3"] }
+    fn is_file_based(&self) -> bool { true }
+    fn form_placeholders(&self) -> FormPlaceholders {
+        FormPlaceholders {
+            name: "my_connection",
+            host: "",
+            port: "",
+            database: "path/to/database.db",
+            database_label: "Database File",
+            user: "",
+            password: "",
+        }
     }
 }
 
 #[async_trait]
 impl DatabaseProvider for SqliteProvider {
-    fn name(&self) -> &str {
-        "sqlite"
+    fn metadata(&self) -> &dyn ProviderMetadata {
+        self
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
     }
 
     async fn test_connection(&self, url: &str) -> Result<()> {
@@ -59,13 +77,7 @@ impl DatabaseProvider for SqliteProvider {
         let pool = self.ensure_pool(url).await?;
         let start = Instant::now();
 
-        let trimmed = sql.trim_start().to_uppercase();
-        let is_query = trimmed.starts_with("SELECT")
-            || trimmed.starts_with("WITH")
-            || trimmed.starts_with("PRAGMA")
-            || trimmed.starts_with("EXPLAIN");
-
-        if is_query {
+        if is_read_query(sql) {
             let rows = sqlx::query(sql).fetch_all(&pool).await?;
             let elapsed = start.elapsed().as_millis() as u64;
 

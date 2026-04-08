@@ -4,49 +4,76 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{Column as _, MySqlPool, Row};
-use tokio::sync::RwLock;
 
-use crate::provider::DatabaseProvider;
+use super::PoolManager;
+use crate::provider::{
+    is_read_query, DatabaseProvider, FormPlaceholders, ProviderCapabilities, ProviderMetadata,
+};
 use crate::schema::*;
 
 pub struct MysqlProvider {
-    pool: RwLock<Option<(String, MySqlPool)>>,
+    pools: PoolManager<MySqlPool>,
 }
 
 impl MysqlProvider {
     pub fn new() -> Self {
         Self {
-            pool: RwLock::new(None),
+            pools: PoolManager::new(),
         }
     }
 
     async fn ensure_pool(&self, url: &str) -> Result<MySqlPool> {
-        {
-            let guard = self.pool.read().await;
-            if let Some((cached_url, pool)) = guard.as_ref() {
-                if cached_url == url && !pool.is_closed() {
-                    return Ok(pool.clone());
-                }
-            }
-        }
-
-        let pool = MySqlPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(std::time::Duration::from_secs(10))
-            .connect(url)
+        self.pools
+            .get_or_create(url, |url| async move {
+                MySqlPoolOptions::new()
+                    .max_connections(5)
+                    .acquire_timeout(std::time::Duration::from_secs(10))
+                    .connect(&url)
+                    .await
+                    .context("failed to connect to MySQL")
+            })
             .await
-            .context("failed to connect to MySQL")?;
+    }
+}
 
-        let mut guard = self.pool.write().await;
-        *guard = Some((url.to_string(), pool.clone()));
-        Ok(pool)
+impl ProviderMetadata for MysqlProvider {
+    fn id(&self) -> &'static str { "mysql" }
+    fn display_name(&self) -> &'static str { "MySQL" }
+    fn default_port(&self) -> u16 { 3306 }
+    fn default_user(&self) -> &'static str { "root" }
+    fn url_scheme(&self) -> &'static str { "mysql" }
+    fn aliases(&self) -> &'static [&'static str] { &["mariadb"] }
+    fn is_file_based(&self) -> bool { false }
+    fn form_placeholders(&self) -> FormPlaceholders {
+        FormPlaceholders {
+            name: "my_connection",
+            host: "localhost",
+            port: "3306",
+            database: "leave empty to list all",
+            database_label: "Database (optional)",
+            user: "root",
+            password: "stored in OS keychain",
+        }
     }
 }
 
 #[async_trait]
 impl DatabaseProvider for MysqlProvider {
-    fn name(&self) -> &str {
-        "mysql"
+    fn metadata(&self) -> &dyn ProviderMetadata {
+        self
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            multi_database: true,
+            schemas: false,
+            roles: false,
+            users: true,
+            create_database: true,
+            create_schema: false,
+            create_role: false,
+            requires_reconnect_for_database_switch: false,
+        }
     }
 
     async fn test_connection(&self, url: &str) -> Result<()> {
@@ -59,14 +86,7 @@ impl DatabaseProvider for MysqlProvider {
         let pool = self.ensure_pool(url).await?;
         let start = Instant::now();
 
-        let trimmed = sql.trim_start().to_uppercase();
-        let is_query = trimmed.starts_with("SELECT")
-            || trimmed.starts_with("WITH")
-            || trimmed.starts_with("SHOW")
-            || trimmed.starts_with("DESCRIBE")
-            || trimmed.starts_with("EXPLAIN");
-
-        if is_query {
+        if is_read_query(sql) {
             let rows = sqlx::query(sql).fetch_all(&pool).await?;
             let elapsed = start.elapsed().as_millis() as u64;
 
@@ -126,14 +146,16 @@ impl DatabaseProvider for MysqlProvider {
         let mut tables = Vec::new();
         for row in &table_rows {
             let name: String = row.get("TABLE_NAME");
-            let columns = self.get_table_columns(url, &name).await?;
+            let columns = get_columns_for_table(&pool, &db_name, &name).await?;
+            let indexes = get_indexes_for_table(&pool, &db_name, &name).await?;
+            let constraints = get_constraints_for_table(&pool, &db_name, &name).await?;
 
             tables.push(Table {
                 schema: db_name.clone(),
                 name,
                 columns,
-                indexes: Vec::new(),
-                constraints: Vec::new(),
+                indexes,
+                constraints,
                 row_count_estimate: None,
             });
         }
@@ -148,7 +170,7 @@ impl DatabaseProvider for MysqlProvider {
         let mut views = Vec::new();
         for row in &view_rows {
             let name: String = row.get("TABLE_NAME");
-            let columns = self.get_table_columns(url, &name).await?;
+            let columns = get_columns_for_table(&pool, &db_name, &name).await?;
             views.push(View {
                 schema: db_name.clone(),
                 name,
@@ -168,48 +190,7 @@ impl DatabaseProvider for MysqlProvider {
         let db_name: String = sqlx::query_scalar("SELECT DATABASE()")
             .fetch_one(&pool)
             .await?;
-
-        let rows = sqlx::query(
-            r#"
-            SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, COLUMN_COMMENT
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-            ORDER BY ORDINAL_POSITION
-            "#,
-        )
-        .bind(&db_name)
-        .bind(table)
-        .fetch_all(&pool)
-        .await?;
-
-        let mut columns = Vec::new();
-        for row in &rows {
-            let name: String = row.get("COLUMN_NAME");
-            let data_type: String = row.get("DATA_TYPE");
-            let is_nullable: String = row.get("IS_NULLABLE");
-            let default_value: Option<String> = row.get("COLUMN_DEFAULT");
-            let column_key: String = row.get("COLUMN_KEY");
-            let comment: String = row.get("COLUMN_COMMENT");
-
-            columns.push(DbColumn {
-                name,
-                data_type,
-                is_nullable: is_nullable == "YES",
-                default_value,
-                is_primary_key: column_key == "PRI",
-                foreign_key: if column_key == "MUL" {
-                    Some(ForeignKey {
-                        referenced_table: String::new(),
-                        referenced_column: String::new(),
-                    })
-                } else {
-                    None
-                },
-                comment: if comment.is_empty() { None } else { Some(comment) },
-            });
-        }
-
-        Ok(columns)
+        get_columns_for_table(&pool, &db_name, table).await
     }
 
     async fn get_table_row_count(&self, url: &str, table: &str) -> Result<i64> {
@@ -239,4 +220,226 @@ impl DatabaseProvider for MysqlProvider {
 
         Ok(plan)
     }
+
+    async fn list_databases(&self, url: &str) -> Result<Vec<DatabaseEntry>> {
+        let pool = self.ensure_pool(url).await?;
+        let current_db: String = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&pool)
+            .await?;
+
+        let rows = sqlx::query(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME",
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let name: String = row.get("SCHEMA_NAME");
+                DatabaseEntry {
+                    is_current: name == current_db,
+                    name,
+                }
+            })
+            .collect())
+    }
+
+    async fn list_roles(&self, url: &str) -> Result<Vec<RoleEntry>> {
+        let pool = self.ensure_pool(url).await?;
+        let rows = sqlx::query("SELECT User, Host FROM mysql.user ORDER BY User")
+            .fetch_all(&pool)
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let user: String = row.get("User");
+                let host: String = row.get("Host");
+                RoleEntry {
+                    name: format!("{user}@{host}"),
+                    is_superuser: false,
+                    can_login: true,
+                    can_create_db: false,
+                    can_create_role: false,
+                }
+            })
+            .collect())
+    }
+
+    async fn get_schema_for_database(
+        &self,
+        base_url: &str,
+        database: &str,
+    ) -> Result<DatabaseSchema> {
+        let url = crate::config::replace_database_in_url(base_url, database)?;
+        self.get_schema(&url).await
+    }
+
+    async fn create_database(&self, url: &str, name: &str) -> Result<()> {
+        let pool = self.ensure_pool(url).await?;
+        let sql = format!("CREATE DATABASE `{}`", name.replace('`', "``"));
+        sqlx::query(&sql).execute(&pool).await?;
+        Ok(())
+    }
 }
+
+async fn get_columns_for_table(
+    pool: &MySqlPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<DbColumn>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE,
+            c.COLUMN_DEFAULT, c.COLUMN_KEY, c.COLUMN_COMMENT
+        FROM information_schema.COLUMNS c
+        WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
+        ORDER BY c.ORDINAL_POSITION
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    // Fetch FK references for this table
+    let fk_rows = sqlx::query(
+        r#"
+        SELECT
+            kcu.COLUMN_NAME,
+            kcu.REFERENCED_TABLE_NAME,
+            kcu.REFERENCED_COLUMN_NAME
+        FROM information_schema.KEY_COLUMN_USAGE kcu
+        WHERE kcu.TABLE_SCHEMA = ?
+          AND kcu.TABLE_NAME = ?
+          AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    let fk_map: std::collections::HashMap<String, ForeignKey> = fk_rows
+        .iter()
+        .map(|r| {
+            let col: String = r.get("COLUMN_NAME");
+            let ref_table: String = r.get("REFERENCED_TABLE_NAME");
+            let ref_col: String = r.get("REFERENCED_COLUMN_NAME");
+            (
+                col,
+                ForeignKey {
+                    referenced_table: ref_table,
+                    referenced_column: ref_col,
+                },
+            )
+        })
+        .collect();
+
+    let mut columns = Vec::new();
+    for row in &rows {
+        let name: String = row.get("COLUMN_NAME");
+        let data_type: String = row.get("DATA_TYPE");
+        let is_nullable: String = row.get("IS_NULLABLE");
+        let default_value: Option<String> = row.get("COLUMN_DEFAULT");
+        let column_key: String = row.get("COLUMN_KEY");
+        let comment: String = row.get("COLUMN_COMMENT");
+
+        columns.push(DbColumn {
+            name: name.clone(),
+            data_type,
+            is_nullable: is_nullable == "YES",
+            default_value,
+            is_primary_key: column_key == "PRI",
+            foreign_key: fk_map.get(&name).cloned(),
+            comment: if comment.is_empty() {
+                None
+            } else {
+                Some(comment)
+            },
+        });
+    }
+
+    Ok(columns)
+}
+
+async fn get_indexes_for_table(
+    pool: &MySqlPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<Index>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            INDEX_NAME,
+            NON_UNIQUE,
+            GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) as COLUMNS
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        GROUP BY INDEX_NAME, NON_UNIQUE
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    let mut indexes = Vec::new();
+    for row in &rows {
+        let name: String = row.get("INDEX_NAME");
+        let non_unique: i64 = row.try_get::<i64, _>("NON_UNIQUE").unwrap_or(1);
+        let columns_str: String = row.try_get::<String, _>("COLUMNS").unwrap_or_default();
+        let columns: Vec<String> = columns_str.split(',').map(|s| s.to_string()).collect();
+
+        indexes.push(Index {
+            name: name.clone(),
+            columns,
+            is_unique: non_unique == 0,
+            is_primary: name == "PRIMARY",
+        });
+    }
+
+    Ok(indexes)
+}
+
+async fn get_constraints_for_table(
+    pool: &MySqlPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<Constraint>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT CONSTRAINT_NAME, CONSTRAINT_TYPE
+        FROM information_schema.TABLE_CONSTRAINTS
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    let mut constraints = Vec::new();
+    for row in &rows {
+        let name: String = row.get("CONSTRAINT_NAME");
+        let ctype: String = row.get("CONSTRAINT_TYPE");
+
+        let constraint_type = match ctype.as_str() {
+            "PRIMARY KEY" => ConstraintType::PrimaryKey,
+            "FOREIGN KEY" => ConstraintType::ForeignKey,
+            "UNIQUE" => ConstraintType::Unique,
+            "CHECK" => ConstraintType::Check,
+            _ => continue,
+        };
+
+        constraints.push(Constraint {
+            name,
+            constraint_type,
+        });
+    }
+
+    Ok(constraints)
+}
+

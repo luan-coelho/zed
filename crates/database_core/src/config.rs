@@ -4,6 +4,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::provider::ProviderMetadata;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     pub connections: HashMap<String, ConnectionConfig>,
@@ -16,51 +18,39 @@ pub struct ConnectionConfig {
     pub port: Option<u16>,
     pub database: Option<String>,
     pub user: Option<String>,
-    /// Environment variable name containing the password
     pub password_env: Option<String>,
-    /// Environment variable name containing the full connection string
     pub connection_string_env: Option<String>,
     pub ssl: Option<bool>,
     pub default: Option<bool>,
 }
 
 impl ConnectionConfig {
-    pub fn connection_url(&self) -> Result<String> {
-        self.connection_url_with_password(None)
-    }
-
-    /// Build the connection URL, optionally using a password from the keychain
-    /// instead of the environment variable.
-    pub fn connection_url_with_password(&self, keychain_password: Option<&str>) -> Result<String> {
+    pub fn connection_url_with_metadata(
+        &self,
+        keychain_password: Option<&str>,
+        metadata: &dyn ProviderMetadata,
+    ) -> Result<String> {
         if let Some(ref env_name) = self.connection_string_env {
             return std::env::var(env_name)
                 .with_context(|| format!("environment variable '{env_name}' not set"));
         }
 
-        // SQLite uses file path, not host/port
-        if self.provider == "sqlite" || self.provider == "sqlite3" {
+        if metadata.is_file_based() {
             let database = self
                 .database
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("database file path required"))?;
-            return Ok(format!("sqlite:{database}"));
+            return Ok(format!("{}:{database}", metadata.url_scheme()));
         }
 
         let host = self.host.as_deref().unwrap_or("localhost");
-        let default_port = match self.provider.as_str() {
-            "mysql" | "mariadb" => 3306,
-            _ => 5432,
-        };
-        let port = self.port.unwrap_or(default_port);
-        let database = self
-            .database
+        let port = self.port.unwrap_or(metadata.default_port());
+        let database = self.database.as_deref().unwrap_or("");
+        let user = self
+            .user
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("database name required"))?;
-        let default_user = match self.provider.as_str() {
-            "mysql" | "mariadb" => "root",
-            _ => "postgres",
-        };
-        let user = self.user.as_deref().unwrap_or(default_user);
+            .unwrap_or(metadata.default_user());
+        let scheme = metadata.url_scheme();
 
         let password = if let Some(pw) = keychain_password {
             pw.to_string()
@@ -69,11 +59,6 @@ impl ConnectionConfig {
                 .with_context(|| format!("environment variable '{env_name}' not set"))?
         } else {
             String::new()
-        };
-
-        let scheme = match self.provider.as_str() {
-            "mysql" | "mariadb" => "mysql",
-            _ => "postgres",
         };
 
         let ssl_mode = if self.ssl.unwrap_or(false) {
@@ -90,6 +75,23 @@ impl ConnectionConfig {
 
         Ok(url)
     }
+
+    pub fn connection_url_for_database(
+        &self,
+        database: &str,
+        keychain_password: Option<&str>,
+        metadata: &dyn ProviderMetadata,
+    ) -> Result<String> {
+        let mut override_config = self.clone();
+        override_config.database = Some(database.to_string());
+        override_config.connection_url_with_metadata(keychain_password, metadata)
+    }
+}
+
+pub fn replace_database_in_url(url: &str, new_db: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(url).context("invalid connection URL")?;
+    parsed.set_path(&format!("/{new_db}"));
+    Ok(parsed.to_string())
 }
 
 impl DatabaseConfig {

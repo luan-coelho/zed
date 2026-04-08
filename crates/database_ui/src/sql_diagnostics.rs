@@ -8,13 +8,16 @@ const SQL_DIAG_SERVER_ID: LanguageServerId = LanguageServerId(9999);
 
 /// Parse SQL and update diagnostics on the buffer.
 /// Shows red underlines for syntax errors.
-pub fn update_sql_diagnostics(buffer: &Entity<Buffer>, cx: &mut gpui::App) {
+pub fn update_sql_diagnostics(
+    buffer: &Entity<Buffer>,
+    provider: &str,
+    cx: &mut gpui::App,
+) {
     buffer.update(cx, |buffer, cx| {
         let snapshot = buffer.snapshot();
         let text = snapshot.text();
         let trimmed = text.trim();
 
-        // Don't diagnose empty buffers
         if trimmed.is_empty() {
             let empty =
                 DiagnosticSet::new(std::iter::empty::<DiagnosticEntry<PointUtf16>>(), &snapshot);
@@ -22,9 +25,8 @@ pub fn update_sql_diagnostics(buffer: &Entity<Buffer>, cx: &mut gpui::App) {
             return;
         }
 
-        // Try to parse with sqlparser
-        let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let result = sqlparser::parser::Parser::parse_sql(&dialect, trimmed);
+        let dialect = dialect_for_provider(provider);
+        let result = sqlparser::parser::Parser::parse_sql(dialect.as_ref(), trimmed);
 
         match result {
             Ok(_) => {
@@ -61,6 +63,20 @@ pub fn update_sql_diagnostics(buffer: &Entity<Buffer>, cx: &mut gpui::App) {
             }
         }
     });
+}
+
+pub(crate) fn dialect_for_provider(provider: &str) -> Box<dyn sqlparser::dialect::Dialect> {
+    let registry = database_core::ProviderRegistry::new();
+    let dialect_name = registry
+        .find_provider_info(provider)
+        .map(|p| p.sql_dialect)
+        .unwrap_or("postgres");
+
+    match dialect_name {
+        "mysql" => Box::new(sqlparser::dialect::MySqlDialect {}),
+        "sqlite" => Box::new(sqlparser::dialect::SQLiteDialect {}),
+        _ => Box::new(sqlparser::dialect::PostgreSqlDialect {}),
+    }
 }
 
 /// Extract error message and approximate location from sqlparser error.

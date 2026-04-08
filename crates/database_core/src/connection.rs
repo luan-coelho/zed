@@ -2,19 +2,21 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::config::{ConnectionConfig, DatabaseConfig};
-use crate::provider::DatabaseProvider;
+use crate::config::DatabaseConfig;
+use crate::provider::{DatabaseProvider, ProviderCapabilities};
 use crate::providers;
-use crate::schema::{DatabaseSchema, QueryResult};
+use crate::schema::{DatabaseEntry, DatabaseSchema, QueryResult, RoleEntry, SchemaEntry};
 
 pub struct ConnectionManager {
     config: Option<DatabaseConfig>,
     active_connection: Option<String>,
     providers: HashMap<String, Box<dyn DatabaseProvider>>,
-    /// Runtime passwords stored securely in memory (from OS keychain).
-    /// Key: connection name, Value: plaintext password.
-    /// These are never persisted to disk.
     passwords: HashMap<String, String>,
+}
+
+struct ActiveContext<'a> {
+    provider: &'a dyn DatabaseProvider,
+    url: String,
 }
 
 impl ConnectionManager {
@@ -59,13 +61,10 @@ impl ConnectionManager {
         self.config.is_some() && self.active_connection.is_some()
     }
 
-    /// Store a password in memory for a named connection.
-    /// This password is used instead of `password_env` when connecting.
     pub fn set_password(&mut self, connection_name: &str, password: String) {
         self.passwords.insert(connection_name.to_string(), password);
     }
 
-    /// Clear a cached provider (forces reconnection on next use).
     pub fn clear_provider(&mut self, connection_name: &str) {
         self.providers.remove(connection_name);
         self.passwords.remove(connection_name);
@@ -99,10 +98,7 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Returns (provider, config, optional in-memory password) for the active connection.
-    fn active_context(
-        &mut self,
-    ) -> Result<(&dyn DatabaseProvider, &ConnectionConfig, Option<&str>)> {
+    fn active_context(&mut self) -> Result<ActiveContext<'_>> {
         self.ensure_provider()?;
 
         let conn_name = self.active_connection.as_ref().unwrap();
@@ -115,20 +111,39 @@ impl ConnectionManager {
             .get(conn_name.as_str())
             .unwrap();
         let password = self.passwords.get(conn_name.as_str()).map(|s| s.as_str());
+        let url = config.connection_url_with_metadata(password, provider.metadata())?;
 
-        Ok((provider.as_ref(), config, password))
+        Ok(ActiveContext {
+            provider: provider.as_ref(),
+            url,
+        })
+    }
+
+    pub fn capabilities_for(&self, conn_name: &str) -> ProviderCapabilities {
+        if let Some(provider) = self.providers.get(conn_name) {
+            return provider.capabilities();
+        }
+        let provider_name = self
+            .config
+            .as_ref()
+            .and_then(|c| c.connections.get(conn_name))
+            .map(|c| c.provider.as_str());
+        if let Some(name) = provider_name {
+            if let Some(provider) = providers::get_provider(name) {
+                return provider.capabilities();
+            }
+        }
+        ProviderCapabilities::default()
     }
 
     pub async fn test_connection(&mut self) -> Result<()> {
-        let (provider, config, password) = self.active_context()?;
-        let url = config.connection_url_with_password(password)?;
-        provider.test_connection(&url).await
+        let ctx = self.active_context()?;
+        ctx.provider.test_connection(&ctx.url).await
     }
 
     pub async fn execute_query(&mut self, sql: &str) -> Result<QueryResult> {
-        let (provider, config, password) = self.active_context()?;
-        let url = config.connection_url_with_password(password)?;
-        provider.execute_query(&url, sql).await
+        let ctx = self.active_context()?;
+        ctx.provider.execute_query(&ctx.url, sql).await
     }
 
     pub async fn execute_query_in_schema(
@@ -136,24 +151,21 @@ impl ConnectionManager {
         sql: &str,
         schema: Option<&str>,
     ) -> Result<QueryResult> {
-        let (provider, config, password) = self.active_context()?;
-        let url = config.connection_url_with_password(password)?;
+        let ctx = self.active_context()?;
         match schema {
-            Some(s) => provider.execute_query_in_schema(&url, sql, s).await,
-            None => provider.execute_query(&url, sql).await,
+            Some(s) => ctx.provider.execute_query_in_schema(&ctx.url, sql, s).await,
+            None => ctx.provider.execute_query(&ctx.url, sql).await,
         }
     }
 
     pub async fn get_schema(&mut self) -> Result<DatabaseSchema> {
-        let (provider, config, password) = self.active_context()?;
-        let url = config.connection_url_with_password(password)?;
-        provider.get_schema(&url).await
+        let ctx = self.active_context()?;
+        ctx.provider.get_schema(&ctx.url).await
     }
 
     pub async fn explain_query(&mut self, sql: &str) -> Result<String> {
-        let (provider, config, password) = self.active_context()?;
-        let url = config.connection_url_with_password(password)?;
-        provider.explain_query(&url, sql).await
+        let ctx = self.active_context()?;
+        ctx.provider.explain_query(&ctx.url, sql).await
     }
 
     pub async fn explain_query_in_schema(
@@ -161,11 +173,118 @@ impl ConnectionManager {
         sql: &str,
         schema: Option<&str>,
     ) -> Result<String> {
-        let (provider, config, password) = self.active_context()?;
-        let url = config.connection_url_with_password(password)?;
+        let ctx = self.active_context()?;
         match schema {
-            Some(s) => provider.explain_query_in_schema(&url, sql, s).await,
-            None => provider.explain_query(&url, sql).await,
+            Some(s) => ctx.provider.explain_query_in_schema(&ctx.url, sql, s).await,
+            None => ctx.provider.explain_query(&ctx.url, sql).await,
+        }
+    }
+
+    pub async fn execute_query_in_database(
+        &mut self,
+        sql: &str,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<QueryResult> {
+        let ctx = self.active_context()?;
+        let db_url = crate::config::replace_database_in_url(&ctx.url, database)?;
+        match schema {
+            Some(s) => ctx.provider.execute_query_in_schema(&db_url, sql, s).await,
+            None => ctx.provider.execute_query(&db_url, sql).await,
+        }
+    }
+
+    pub async fn explain_query_in_database(
+        &mut self,
+        sql: &str,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<String> {
+        let ctx = self.active_context()?;
+        let db_url = crate::config::replace_database_in_url(&ctx.url, database)?;
+        match schema {
+            Some(s) => ctx.provider.explain_query_in_schema(&db_url, sql, s).await,
+            None => ctx.provider.explain_query(&db_url, sql).await,
+        }
+    }
+
+    pub async fn list_databases(&mut self) -> Result<Vec<DatabaseEntry>> {
+        let ctx = self.active_context()?;
+        ctx.provider.list_databases(&ctx.url).await
+    }
+
+    pub async fn list_schemas(&mut self) -> Result<Vec<SchemaEntry>> {
+        let ctx = self.active_context()?;
+        ctx.provider.list_schemas(&ctx.url).await
+    }
+
+    pub async fn list_roles(&mut self) -> Result<Vec<RoleEntry>> {
+        let ctx = self.active_context()?;
+        ctx.provider.list_roles(&ctx.url).await
+    }
+
+    pub async fn get_schema_for_database(&mut self, database: &str) -> Result<DatabaseSchema> {
+        let ctx = self.active_context()?;
+        ctx.provider
+            .get_schema_for_database(&ctx.url, database)
+            .await
+    }
+
+    pub fn url_for_database(&mut self, conn_name: &str, database: &str) -> Result<String> {
+        let provider = self
+            .providers
+            .get(conn_name)
+            .ok_or_else(|| anyhow::anyhow!("Provider not initialized for '{conn_name}'"))?;
+
+        let config = self
+            .config
+            .as_ref()
+            .and_then(|c| c.connections.get(conn_name))
+            .ok_or_else(|| anyhow::anyhow!("Connection '{conn_name}' not found"))?;
+
+        let password = self.passwords.get(conn_name).map(|s| s.as_str());
+        config.connection_url_for_database(database, password, provider.metadata())
+    }
+
+    pub async fn create_database(&mut self, name: &str) -> Result<()> {
+        let ctx = self.active_context()?;
+        ctx.provider.create_database(&ctx.url, name).await
+    }
+
+    pub async fn create_schema(&mut self, name: &str) -> Result<()> {
+        let ctx = self.active_context()?;
+        ctx.provider.create_schema(&ctx.url, name).await
+    }
+
+    pub async fn create_role(&mut self, name: &str) -> Result<()> {
+        let ctx = self.active_context()?;
+        ctx.provider.create_role(&ctx.url, name).await
+    }
+
+    pub async fn begin_transaction(&mut self, isolation: Option<&str>) -> Result<()> {
+        let ctx = self.active_context()?;
+        ctx.provider.begin_transaction(&ctx.url, isolation).await
+    }
+
+    pub async fn commit_transaction(&mut self) -> Result<()> {
+        let ctx = self.active_context()?;
+        ctx.provider.commit_transaction(&ctx.url).await
+    }
+
+    pub async fn rollback_transaction(&mut self) -> Result<()> {
+        let ctx = self.active_context()?;
+        ctx.provider.rollback_transaction(&ctx.url).await
+    }
+
+    pub async fn execute_in_transaction(&mut self, sql: &str) -> Result<QueryResult> {
+        let ctx = self.active_context()?;
+        ctx.provider.execute_in_transaction(&ctx.url, sql).await
+    }
+
+    pub async fn has_active_transaction(&mut self) -> bool {
+        match self.active_context() {
+            Ok(ctx) => ctx.provider.has_active_transaction(&ctx.url).await,
+            Err(_) => false,
         }
     }
 }

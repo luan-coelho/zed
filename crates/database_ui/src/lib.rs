@@ -1,5 +1,6 @@
 mod database_panel;
 mod database_panel_settings;
+mod panel;
 pub mod result_panel;
 pub mod sql_completion;
 mod sql_diagnostics;

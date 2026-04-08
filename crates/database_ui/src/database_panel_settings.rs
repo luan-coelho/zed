@@ -1,19 +1,23 @@
 use workspace::dock::DockPosition;
 
-/// Temporary hardcoded settings for the database panel.
-/// TODO: Integrate with settings_content and RegisterSetting macro.
-pub struct DatabasePanelSettings;
+pub struct DatabasePanelSettings {
+    pub dock: DockPosition,
+    pub default_width: gpui::Pixels,
+}
+
+impl Default for DatabasePanelSettings {
+    fn default() -> Self {
+        Self {
+            dock: DockPosition::Right,
+            default_width: gpui::px(360.),
+        }
+    }
+}
 
 impl DatabasePanelSettings {
-    pub fn dock() -> DockPosition {
-        DockPosition::Right
-    }
-
-    pub fn default_width() -> gpui::Pixels {
-        gpui::px(360.)
+    pub fn global() -> Self {
+        Self::default()
     }
 }
 
-pub fn init(_cx: &mut gpui::App) {
-    // TODO: Register settings once integrated with settings_content
-}
+pub fn init(_cx: &mut gpui::App) {}

@@ -1,4 +1,4 @@
-use crate::sql_diagnostics::parse_error_location;
+use crate::sql_diagnostics::{dialect_for_provider, parse_error_location};
 use sqlparser::parser::{Parser, ParserError};
 
 fn parse_err(sql: &str) -> ParserError {
@@ -154,4 +154,43 @@ fn test_empty_string_is_valid() {
     // Empty string parses as 0 statements, which is Ok
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
     assert!(Parser::parse_sql(&dialect, "").is_ok());
+}
+
+// ── dialect_for_provider ───────────────────────────────────────────
+
+#[test]
+fn test_dialect_postgres() {
+    let dialect = dialect_for_provider("postgres");
+    assert!(Parser::parse_sql(dialect.as_ref(), "SELECT 1").is_ok());
+}
+
+#[test]
+fn test_dialect_postgresql_alias() {
+    let dialect = dialect_for_provider("postgresql");
+    assert!(Parser::parse_sql(dialect.as_ref(), "SELECT 1").is_ok());
+}
+
+#[test]
+fn test_dialect_mysql() {
+    let dialect = dialect_for_provider("mysql");
+    // MySQL backtick-quoted identifiers
+    assert!(Parser::parse_sql(dialect.as_ref(), "SELECT `id` FROM `users`").is_ok());
+}
+
+#[test]
+fn test_dialect_mariadb_alias() {
+    let dialect = dialect_for_provider("mariadb");
+    assert!(Parser::parse_sql(dialect.as_ref(), "SELECT `id` FROM `users`").is_ok());
+}
+
+#[test]
+fn test_dialect_sqlite() {
+    let dialect = dialect_for_provider("sqlite");
+    assert!(Parser::parse_sql(dialect.as_ref(), "SELECT 1").is_ok());
+}
+
+#[test]
+fn test_dialect_unknown_defaults_to_postgres() {
+    let dialect = dialect_for_provider("oracle");
+    assert!(Parser::parse_sql(dialect.as_ref(), "SELECT 1").is_ok());
 }

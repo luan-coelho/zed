@@ -1,9 +1,12 @@
 use database_core::QueryResult;
+use editor::Editor;
 use gpui::{
-    actions, div, Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, WeakEntity,
-    Window,
+    actions, anchored, deferred, div, Action, App, AppContext, AsyncWindowContext, Context, Corner,
+    DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription,
+    WeakEntity, Window,
 };
+use ui::ContextMenu;
 use theme::ActiveTheme;
 use ui::{prelude::*, Tooltip};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -19,6 +22,7 @@ fn escape_csv(value: &str) -> String {
 
 actions!(database_result_panel, [ToggleFocus,]);
 
+
 /// Global channel to send query results to the result panel.
 pub struct QueryResultEvent {
     pub result: QueryResult,
@@ -31,6 +35,7 @@ const PAGE_SIZE: usize = 50;
 #[derive(Clone, Copy, PartialEq)]
 enum ResultView {
     Output,
+    History,
     Table(usize),
 }
 
@@ -40,6 +45,12 @@ pub struct DatabaseResultPanel {
     active_view: ResultView,
     selected_row: Option<usize>,
     output_log: Vec<String>,
+    history: Vec<HistoryEntry>,
+    sort_column: Option<usize>,
+    sort_ascending: bool,
+    filter_text: String,
+    filter_editor: Entity<Editor>,
+    tab_context_menu: Option<(Entity<ContextMenu>, Subscription)>,
 }
 
 struct QueryResultEntry {
@@ -49,15 +60,45 @@ struct QueryResultEntry {
     timestamp: String,
 }
 
+#[derive(Clone)]
+struct HistoryEntry {
+    query: String,
+    timestamp: String,
+    success: bool,
+    rows_affected: u64,
+    execution_time_ms: u64,
+}
+
 impl DatabaseResultPanel {
-    fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
+
+        let filter_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Filter rows...", window, cx);
+            editor
+        });
+
+        cx.subscribe(&filter_editor, |this: &mut Self, editor, event, cx| {
+            if matches!(event, editor::EditorEvent::BufferEdited { .. }) {
+                this.filter_text = editor.read(cx).text(cx).trim().to_lowercase();
+                cx.notify();
+            }
+        })
+        .detach();
+
         Self {
             focus_handle,
             results: Vec::new(),
             active_view: ResultView::Output,
             selected_row: None,
             output_log: Vec::new(),
+            history: Vec::new(),
+            sort_column: None,
+            sort_ascending: true,
+            filter_text: String::new(),
+            filter_editor,
+            tab_context_menu: None,
         }
     }
 
@@ -98,6 +139,14 @@ impl DatabaseResultPanel {
             ));
         }
 
+        self.history.push(HistoryEntry {
+            query: query.clone(),
+            timestamp: now.clone(),
+            success: !is_error,
+            rows_affected: result.rows_affected,
+            execution_time_ms: result.execution_time_ms,
+        });
+
         self.results.push(QueryResultEntry {
             query,
             result,
@@ -107,6 +156,8 @@ impl DatabaseResultPanel {
         let idx = self.results.len() - 1;
         self.active_view = ResultView::Table(idx);
         self.selected_row = None;
+        self.sort_column = None;
+        self.sort_ascending = true;
         cx.emit(PanelEvent::Activate);
         cx.notify();
     }
@@ -127,7 +178,7 @@ impl DatabaseResultPanel {
     fn active_result_data(&self) -> Option<&QueryResult> {
         match self.active_view {
             ResultView::Table(idx) => self.results.get(idx).map(|e| &e.result),
-            ResultView::Output => None,
+            ResultView::Output | ResultView::History => None,
         }
     }
 
@@ -201,8 +252,115 @@ impl DatabaseResultPanel {
         }
     }
 
+    fn deploy_tab_context_menu(
+        &mut self,
+        tab_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = cx.entity().downgrade();
+
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.entry("Close", None, {
+                let w = weak.clone();
+                move |_window, cx| {
+                    if let Some(panel) = w.upgrade() {
+                        panel.update(cx, |this, cx| this.close_tab(tab_index, cx));
+                    }
+                }
+            })
+            .entry("Close Others", None, {
+                let w = weak.clone();
+                move |_window, cx| {
+                    if let Some(panel) = w.upgrade() {
+                        panel.update(cx, |this, cx| this.close_other_tabs(tab_index, cx));
+                    }
+                }
+            })
+            .separator()
+            .entry("Close Left", None, {
+                let w = weak.clone();
+                move |_window, cx| {
+                    if let Some(panel) = w.upgrade() {
+                        panel.update(cx, |this, cx| this.close_tabs_left(tab_index, cx));
+                    }
+                }
+            })
+            .entry("Close Right", None, {
+                let w = weak.clone();
+                move |_window, cx| {
+                    if let Some(panel) = w.upgrade() {
+                        panel.update(cx, |this, cx| this.close_tabs_right(tab_index, cx));
+                    }
+                }
+            })
+            .separator()
+            .entry("Close All", None, {
+                let w = weak.clone();
+                move |_window, cx| {
+                    if let Some(panel) = w.upgrade() {
+                        panel.update(cx, |this, cx| this.close_all_tabs(cx));
+                    }
+                }
+            })
+        });
+
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, _cx| {
+            this.tab_context_menu.take();
+        });
+        self.tab_context_menu = Some((menu, subscription));
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.results.len() {
+            self.results.remove(index);
+        }
+        self.reset_tab_view(cx);
+    }
+
+    fn close_other_tabs(&mut self, keep: usize, cx: &mut Context<Self>) {
+        if keep < self.results.len() {
+            let kept = self.results.remove(keep);
+            self.results.clear();
+            self.results.push(kept);
+        }
+        self.reset_tab_view(cx);
+    }
+
+    fn close_tabs_left(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index > 0 && index <= self.results.len() {
+            self.results.drain(..index);
+        }
+        self.reset_tab_view(cx);
+    }
+
+    fn close_tabs_right(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index + 1 < self.results.len() {
+            self.results.truncate(index + 1);
+        }
+        self.reset_tab_view(cx);
+    }
+
+    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        self.results.clear();
+        self.reset_tab_view(cx);
+    }
+
+    fn reset_tab_view(&mut self, cx: &mut Context<Self>) {
+        self.active_view = if self.results.is_empty() {
+            ResultView::Output
+        } else {
+            ResultView::Table(self.results.len().saturating_sub(1))
+        };
+        self.sort_column = None;
+        self.sort_ascending = true;
+        cx.notify();
+    }
+
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_output_active = self.active_view == ResultView::Output;
+        let is_history_active = self.active_view == ResultView::History;
 
         let mut tabs = div().flex().items_center().gap_0().px_1().overflow_hidden();
 
@@ -245,6 +403,45 @@ impl DatabaseResultPanel {
                 ),
         );
 
+        // Fixed "History" tab
+        tabs = tabs.child(
+            div()
+                .id("history-tab")
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .when(is_history_active, |d| {
+                    d.border_b_2()
+                        .border_color(cx.theme().colors().text_accent)
+                })
+                .hover(|d| d.bg(cx.theme().colors().ghost_element_hover).rounded_t_md())
+                .on_click(cx.listener(|this, _, _w, cx| {
+                    this.active_view = ResultView::History;
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(IconName::CountdownTimer)
+                        .size(IconSize::XSmall)
+                        .color(if is_history_active {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }),
+                )
+                .child(
+                    Label::new(format!("History ({})", self.history.len()))
+                        .size(LabelSize::XSmall)
+                        .color(if is_history_active {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }),
+                ),
+        );
+
         // Result tabs
         for (i, entry) in self.results.iter().enumerate() {
             let is_active = self.active_view == ResultView::Table(i);
@@ -277,7 +474,12 @@ impl DatabaseResultPanel {
                     .hover(|d| d.bg(cx.theme().colors().ghost_element_hover).rounded_t_md())
                     .on_click(cx.listener(move |this, _, _w, cx| {
                         this.active_view = ResultView::Table(i);
+                        this.sort_column = None;
+                        this.sort_ascending = true;
                         cx.notify();
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                        this.deploy_tab_context_menu(i, window, cx);
                     }))
                     .child(
                         Icon::new(IconName::ListTree)
@@ -379,20 +581,187 @@ impl DatabaseResultPanel {
             .into_any_element()
     }
 
+    fn render_history(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        if self.history.is_empty() {
+            return div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .flex_1()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::CountdownTimer)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("No query history yet.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+
+        let entries: Vec<HistoryEntry> = self.history.iter().rev().cloned().collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .id("history-scroll")
+            .overflow_y_scroll()
+            .p_2()
+            .child(
+                gpui::uniform_list("history-entries", entries.len(), move |range, _w, cx| {
+                    let alt_bg = cx.theme().colors().ghost_element_hover;
+                    range
+                        .map(|ix| {
+                            let entry = &entries[ix];
+                            let query_preview = if entry.query.len() > 100 {
+                                format!("{}...", &entry.query[..97])
+                            } else {
+                                entry.query.clone()
+                            };
+                            let status_icon = if entry.success {
+                                IconName::Check
+                            } else {
+                                IconName::Close
+                            };
+                            let status_color = if entry.success {
+                                Color::Success
+                            } else {
+                                Color::Error
+                            };
+                            let stats = if entry.success {
+                                format!(
+                                    "{} rows · {}ms",
+                                    entry.rows_affected, entry.execution_time_ms
+                                )
+                            } else {
+                                "error".to_string()
+                            };
+
+                            let query_for_copy = entry.query.clone();
+
+                            div()
+                                .id(ElementId::Name(format!("history-{ix}").into()))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .when(ix % 2 == 1, |d| d.bg(alt_bg))
+                                .cursor_pointer()
+                                .on_click(move |_, _w, cx| {
+                                    cx.write_to_clipboard(
+                                        gpui::ClipboardItem::new_string(query_for_copy.clone()),
+                                    );
+                                })
+                                .child(
+                                    Icon::new(status_icon)
+                                        .size(IconSize::XSmall)
+                                        .color(status_color),
+                                )
+                                .child(
+                                    Label::new(entry.timestamp.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .child(
+                                            Label::new(query_preview)
+                                                .size(LabelSize::XSmall),
+                                        ),
+                                )
+                                .child(
+                                    Label::new(stats)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .into_any_element()
+                        })
+                        .collect()
+                })
+                .flex_1(),
+            )
+            .into_any_element()
+    }
+
     fn render_active_result(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.active_view == ResultView::Output {
             return self.render_output_log(cx).into_any_element();
         }
+        if self.active_view == ResultView::History {
+            return self.render_history(cx).into_any_element();
+        }
 
         let idx = match self.active_view {
             ResultView::Table(i) => i,
-            ResultView::Output => unreachable!(),
+            ResultView::Output | ResultView::History => unreachable!(),
         };
         let Some(entry) = self.results.get(idx) else {
             return self.render_empty().into_any_element();
         };
 
         let result = &entry.result;
+
+        // Error results: display full-width error message instead of table
+        let is_error = result
+            .columns
+            .first()
+            .is_some_and(|c| c == "Error");
+        if is_error {
+            let error_msg = result
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .cloned()
+                .unwrap_or_else(|| "Unknown error".to_string());
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .p_4()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Close)
+                                .size(IconSize::Small)
+                                .color(Color::Error),
+                        )
+                        .child(
+                            Label::new("Query Error")
+                                .weight(FontWeight::SEMIBOLD)
+                                .color(Color::Error),
+                        ),
+                )
+                .child(
+                    div()
+                        .p_3()
+                        .rounded_md()
+                        .bg(cx.theme().colors().ghost_element_hover)
+                        .w_full()
+                        .child(
+                            Label::new(error_msg)
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        ),
+                )
+                .child(
+                    Label::new(format!("Query: {}", entry.query))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
 
         if result.columns.is_empty() {
             return div()
@@ -431,21 +800,49 @@ impl DatabaseResultPanel {
             px(110.)
         };
 
+        // Sort rows if a sort column is set
+        let sorted_rows = if let Some(sort_col) = self.sort_column {
+            let mut rows = result.rows.clone();
+            let ascending = self.sort_ascending;
+            rows.sort_by(|a, b| {
+                let val_a = a.get(sort_col).map(|s| s.as_str()).unwrap_or("");
+                let val_b = b.get(sort_col).map(|s| s.as_str()).unwrap_or("");
+                let cmp = val_a.cmp(val_b);
+                if ascending { cmp } else { cmp.reverse() }
+            });
+            rows
+        } else {
+            result.rows.clone()
+        };
+
+        // Filter rows by text
+        let filtered_rows = if self.filter_text.is_empty() {
+            sorted_rows
+        } else {
+            let filter_lower = self.filter_text.to_lowercase();
+            sorted_rows
+                .into_iter()
+                .filter(|row| row.iter().any(|val| val.to_lowercase().contains(&filter_lower)))
+                .collect()
+        };
+
         // Pagination
-        let total_rows = result.rows.len();
+        let total_rows = filtered_rows.len();
         let total_pages = (total_rows + PAGE_SIZE - 1) / PAGE_SIZE;
         let current_page = entry.page.min(total_pages.saturating_sub(1));
         let page_start = current_page * PAGE_SIZE;
         let page_end = (page_start + PAGE_SIZE).min(total_rows);
-        let page_rows: Vec<Vec<String>> = result.rows[page_start..page_end].to_vec();
+        let page_rows: Vec<Vec<String>> = filtered_rows[page_start..page_end].to_vec();
         let selected_row = self.selected_row;
+        let sort_column = self.sort_column;
+        let sort_ascending = self.sort_ascending;
 
         div()
             .flex()
             .flex_col()
             .flex_1()
             .w_full()
-            // Column header
+            // Column header (clickable for sort)
             .child({
                 let mut header = div()
                     .flex()
@@ -455,7 +852,6 @@ impl DatabaseResultPanel {
                     .border_color(cx.theme().colors().border)
                     .bg(cx.theme().colors().title_bar_background);
 
-                // Row number column
                 header = header.child(
                     div()
                         .w(px(40.))
@@ -465,15 +861,40 @@ impl DatabaseResultPanel {
                         .child(Label::new("#").size(LabelSize::XSmall).color(Color::Muted)),
                 );
 
-                for col in &result.columns {
+                for (col_idx, col) in result.columns.iter().enumerate() {
+                    let is_sorted = sort_column == Some(col_idx);
+                    let sort_indicator = if is_sorted {
+                        if sort_ascending { " ▲" } else { " ▼" }
+                    } else {
+                        ""
+                    };
+                    let col_name = col.clone();
                     header = header.child(
                         div()
+                            .id(ElementId::Name(format!("col-header-{col_idx}").into()))
                             .w(col_width)
                             .flex_shrink_0()
                             .px_2()
                             .py_1()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(cx.theme().colors().ghost_element_hover))
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                let direction = if this.sort_column == Some(col_idx) {
+                                    this.sort_ascending = !this.sort_ascending;
+                                    if this.sort_ascending { "ASC" } else { "DESC" }
+                                } else {
+                                    this.sort_column = Some(col_idx);
+                                    this.sort_ascending = true;
+                                    "ASC"
+                                };
+                                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                                this.output_log.push(format!(
+                                    "[{now}] ORDER BY {col_name} {direction}"
+                                ));
+                                cx.notify();
+                            }))
                             .child(
-                                Label::new(col.clone())
+                                Label::new(format!("{col}{sort_indicator}"))
                                     .size(LabelSize::XSmall)
                                     .weight(FontWeight::SEMIBOLD),
                             ),
@@ -646,6 +1067,43 @@ impl DatabaseResultPanel {
                                 )
                             }),
                     )
+                    // Center: filter input
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Icon::new(IconName::MagnifyingGlass)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div()
+                                    .w(px(150.))
+                                    .child(self.filter_editor.clone()),
+                            )
+                            .when(!self.filter_text.is_empty(), |d| {
+                                d.child(
+                                    Label::new(format!("{total_rows} matches"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    IconButton::new("clear-filter", IconName::Close)
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(|_w, cx| Tooltip::simple("Clear filter", cx))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.filter_text.clear();
+                                            this.filter_editor.update(cx, |editor, cx| {
+                                                editor.set_text("", window, cx);
+                                            });
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    )
                     // Right: export buttons
                     .child(
                         div()
@@ -719,6 +1177,10 @@ impl Panel for DatabaseResultPanel {
         "database_result_panel"
     }
 
+    fn starts_open(&self, _w: &Window, _cx: &App) -> bool {
+        false
+    }
+
     fn position(&self, _w: &Window, _cx: &App) -> DockPosition {
         DockPosition::Bottom
     }
@@ -766,9 +1228,45 @@ impl Render for DatabaseResultPanel {
                     .items_center()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(self.render_tab_bar(cx)),
+                    .child(self.render_tab_bar(cx))
+                    .child(div().flex_1())
+                    .when(!self.results.is_empty(), |d| {
+                        d.child(
+                            IconButton::new("close-all-tabs", IconName::ListTree)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(|_w, cx| Tooltip::simple("Close all result tabs", cx))
+                                .on_click(cx.listener(|this, _, _w, cx| {
+                                    this.results.clear();
+                                    this.active_view = ResultView::Output;
+                                    this.sort_column = None;
+                                    this.sort_ascending = true;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        IconButton::new("close-result-panel", IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(|_w, cx| Tooltip::simple("Close panel", cx))
+                            .on_click(cx.listener(|_this, _, _w, cx| {
+                                cx.emit(PanelEvent::Close);
+                            })),
+                    )
+                    .px_1(),
             )
             // Active result
             .child(self.render_active_result(cx))
+            .when_some(self.tab_context_menu.as_ref(), |d, (menu, _)| {
+                d.child(
+                    deferred(
+                        anchored()
+                            .anchor(Corner::TopLeft)
+                            .child(menu.clone()),
+                    )
+                    .with_priority(1),
+                )
+            })
     }
 }

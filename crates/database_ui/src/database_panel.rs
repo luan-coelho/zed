@@ -1,21 +1,22 @@
 use crate::database_panel_settings::DatabasePanelSettings;
-use crate::result_panel::DatabaseResultPanel;
-use crate::sql_completion::SqlCompletionProvider;
 use anyhow::Result;
-use database_core::{ConnectionManager, DatabaseConfig, DatabaseSchema, Table, View};
+use database_core::{
+    ConnectionManager, DatabaseConfig, DatabaseEntry, DatabaseSchema, ProviderCapabilities,
+    RoleEntry, SchemaEntry,
+};
 use editor::Editor;
 use gpui::{
-    actions, anchored, deferred, div, Action, AnyElement, App, AsyncWindowContext, Context, Corner,
-    DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Point, Render, SharedString, Styled, Subscription,
+    actions, anchored, deferred, div, Action, App, AsyncWindowContext, Context, Corner,
+    Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
+    ParentElement, Point, Render, Styled, Subscription,
     Task, WeakEntity, Window,
 };
 use gpui_tokio::Tokio;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use theme::ActiveTheme;
 use tokio::sync::RwLock;
-use ui::{prelude::*, ContextMenu, Tooltip};
+use ui::{prelude::*, ContextMenu};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::Workspace;
 
@@ -37,47 +38,47 @@ actions!(
 // ── Data types ──────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum ConnectionScope {
+pub(crate) enum ConnectionScope {
     Global,
     Project,
 }
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-struct ConnectionEntry {
-    name: String,
-    provider: String,
-    host: String,
-    port: String,
-    database: String,
-    status: ConnectionStatus,
-    scope: ConnectionScope,
+pub(crate) struct ConnectionEntry {
+    pub(crate) name: String,
+    pub(crate) provider: String,
+    pub(crate) host: String,
+    pub(crate) port: String,
+    pub(crate) database: String,
+    pub(crate) status: ConnectionStatus,
+    pub(crate) scope: ConnectionScope,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum ConnectionStatus {
+pub(crate) enum ConnectionStatus {
     Disconnected,
     Connecting,
     Connected,
     Error(String),
 }
 
-struct ConnectionForm {
-    name_editor: Entity<Editor>,
-    host_editor: Entity<Editor>,
-    port_editor: Entity<Editor>,
-    database_editor: Entity<Editor>,
-    user_editor: Entity<Editor>,
-    password_editor: Entity<Editor>,
-    provider: String,
-    scope: ConnectionScope,
-    editing: Option<String>,
-    error_message: Option<String>,
-    test_status: Option<TestStatus>,
+pub(crate) struct ConnectionForm {
+    pub(crate) name_editor: Entity<Editor>,
+    pub(crate) host_editor: Entity<Editor>,
+    pub(crate) port_editor: Entity<Editor>,
+    pub(crate) database_editor: Entity<Editor>,
+    pub(crate) user_editor: Entity<Editor>,
+    pub(crate) password_editor: Entity<Editor>,
+    pub(crate) provider: String,
+    pub(crate) scope: ConnectionScope,
+    pub(crate) editing: Option<String>,
+    pub(crate) error_message: Option<String>,
+    pub(crate) test_status: Option<TestStatus>,
 }
 
 impl ConnectionForm {
-    fn editors(&self) -> Vec<&Entity<Editor>> {
+    pub(crate) fn editors(&self) -> Vec<&Entity<Editor>> {
         vec![
             &self.name_editor,
             &self.host_editor,
@@ -90,39 +91,133 @@ impl ConnectionForm {
 }
 
 #[derive(Clone, Debug)]
-enum TestStatus {
+pub(crate) enum TestStatus {
     Testing,
     Success,
     Failed(String),
 }
 
-const PROVIDERS: &[(&str, &str, &str)] = &[
-    ("postgres", "PostgreSQL", "5432"),
-    ("mysql", "MySQL", "3306"),
-    ("sqlite", "SQLite", ""),
-];
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub(crate) enum TransactionMode {
+    #[default]
+    Auto,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub(crate) enum IsolationLevel {
+    #[default]
+    DatabaseDefault,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    pub(crate) fn as_sql(&self) -> Option<&'static str> {
+        match self {
+            Self::DatabaseDefault => None,
+            Self::ReadCommitted => Some("READ COMMITTED"),
+            Self::RepeatableRead => Some("REPEATABLE READ"),
+            Self::Serializable => Some("SERIALIZABLE"),
+        }
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::DatabaseDefault => "Database Default",
+            Self::ReadCommitted => "Read Committed",
+            Self::RepeatableRead => "Repeatable Read",
+            Self::Serializable => "Serializable",
+        }
+    }
+}
+
+// ── Table Editor ───────────────────────────────────────────────────
+
+pub(crate) struct TableEditor {
+    #[allow(dead_code)]
+    pub(crate) conn_name: String,
+    #[allow(dead_code)]
+    pub(crate) database: Option<String>,
+    pub(crate) original_schema: String,
+    pub(crate) original_name: String,
+    pub(crate) original_columns: Vec<OriginalColumn>,
+    pub(crate) original_indexes: Vec<OriginalIndex>,
+    pub(crate) name_editor: Entity<Editor>,
+    pub(crate) comment_editor: Entity<Editor>,
+    pub(crate) columns: Vec<ColumnEditor>,
+    pub(crate) indexes: Vec<IndexEditor>,
+    pub(crate) error_message: Option<String>,
+}
+
+pub(crate) struct OriginalColumn {
+    #[allow(dead_code)]
+    pub(crate) name: String,
+    pub(crate) data_type: String,
+    pub(crate) is_nullable: bool,
+    pub(crate) default_value: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) is_primary_key: bool,
+}
+
+pub(crate) struct OriginalIndex {
+    pub(crate) name: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) is_unique: bool,
+}
+
+pub(crate) struct ColumnEditor {
+    pub(crate) original_name: Option<String>,
+    pub(crate) name_editor: Entity<Editor>,
+    pub(crate) type_editor: Entity<Editor>,
+    pub(crate) nullable: bool,
+    pub(crate) default_editor: Entity<Editor>,
+    pub(crate) is_primary_key: bool,
+    pub(crate) marked_for_deletion: bool,
+}
+
+pub(crate) struct IndexEditor {
+    pub(crate) original_name: Option<String>,
+    pub(crate) name_editor: Entity<Editor>,
+    pub(crate) columns_editor: Entity<Editor>,
+    pub(crate) is_unique: bool,
+    pub(crate) marked_for_deletion: bool,
+}
 
 // ── Main struct ─────────────────────────────────────────────────────
 
 pub struct DatabasePanel {
-    focus_handle: FocusHandle,
-    _workspace: WeakEntity<Workspace>,
-    connection_manager: Arc<RwLock<ConnectionManager>>,
-    connections: Vec<ConnectionEntry>,
-    schemas: std::collections::HashMap<String, DatabaseSchema>,
-    active_schema_for_completions: Arc<RwLock<Option<DatabaseSchema>>>,
-    active_schema_name_for_completions: Arc<RwLock<Option<String>>>,
-    expanded_nodes: HashSet<String>,
-    selected_node: Option<String>,
-    project_path: Option<String>,
-    global_path: String,
-    active_query_connection: Option<String>,
-    active_schema: Option<String>,
-    conn_form: Option<ConnectionForm>,
-    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
-    search_editor: Entity<Editor>,
-    search_filter: String,
-    _pending_task: Option<Task<()>>,
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) _workspace: WeakEntity<Workspace>,
+    pub(crate) connection_manager: Arc<RwLock<ConnectionManager>>,
+    pub(crate) connections: Vec<ConnectionEntry>,
+    pub(crate) schemas: HashMap<String, DatabaseSchema>,
+    pub(crate) active_schema_for_completions: Arc<RwLock<Option<DatabaseSchema>>>,
+    pub(crate) active_schema_name_for_completions: Arc<RwLock<Option<String>>>,
+    pub(crate) expanded_nodes: HashSet<String>,
+    pub(crate) selected_node: Option<String>,
+    pub(crate) project_path: Option<String>,
+    pub(crate) global_path: String,
+    pub(crate) active_query_connection: Option<String>,
+    pub(crate) active_query_database: Option<String>,
+    pub(crate) active_schema: Option<String>,
+    pub(crate) conn_form: Option<ConnectionForm>,
+    pub(crate) context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    pub(crate) search_editor: Entity<Editor>,
+    pub(crate) search_filter: String,
+    pub(crate) _pending_task: Option<Task<()>>,
+    pub(crate) database_lists: HashMap<String, Vec<DatabaseEntry>>,
+    pub(crate) schema_lists: HashMap<String, Vec<SchemaEntry>>,
+    pub(crate) database_schemas: HashMap<String, DatabaseSchema>,
+    pub(crate) role_lists: HashMap<String, Vec<RoleEntry>>,
+    pub(crate) connection_capabilities: HashMap<String, ProviderCapabilities>,
+    pub(crate) loading_nodes: HashSet<String>,
+    pub(crate) transaction_mode: TransactionMode,
+    pub(crate) isolation_level: IsolationLevel,
+    pub(crate) read_only: bool,
+    pub(crate) in_transaction: bool,
+    pub(crate) table_editor: Option<TableEditor>,
 }
 
 fn make_entry(
@@ -192,7 +287,7 @@ impl DatabasePanel {
                 _workspace: weak_workspace,
                 connection_manager: Arc::new(RwLock::new(ConnectionManager::new())),
                 connections: Vec::new(),
-                schemas: std::collections::HashMap::new(),
+                schemas: HashMap::new(),
                 active_schema_for_completions: Arc::new(RwLock::new(None)),
                 active_schema_name_for_completions: Arc::new(RwLock::new(None)),
                 expanded_nodes: HashSet::new(),
@@ -200,12 +295,24 @@ impl DatabasePanel {
                 project_path,
                 global_path,
                 active_query_connection: None,
+                active_query_database: None,
                 active_schema: None,
                 conn_form: None,
                 context_menu: None,
                 search_editor,
                 search_filter: String::new(),
                 _pending_task: None,
+                database_lists: HashMap::new(),
+                schema_lists: HashMap::new(),
+                database_schemas: HashMap::new(),
+                role_lists: HashMap::new(),
+                connection_capabilities: HashMap::new(),
+                loading_nodes: HashSet::new(),
+                transaction_mode: TransactionMode::default(),
+                isolation_level: IsolationLevel::default(),
+                read_only: false,
+                in_transaction: false,
+                table_editor: None,
             };
             panel.load_connections(cx);
             panel
@@ -229,12 +336,29 @@ impl DatabasePanel {
     /// Returns (database_name, active_schema) for the active connection.
     pub fn active_connection_info(&self) -> Option<(String, String)> {
         let conn_name = self.active_query_connection.as_ref()?;
-        let db_schema = self.schemas.get(conn_name)?;
         let schema = self
             .active_schema
             .clone()
             .unwrap_or_else(|| "public".to_string());
-        Some((db_schema.name.clone(), schema))
+
+        // Try flat schemas first (SQLite), then database_schemas (Postgres/MySQL)
+        if let Some(db_schema) = self.schemas.get(conn_name) {
+            return Some((db_schema.name.clone(), schema));
+        }
+
+        // For multi-database providers, find the first loaded database schema
+        let prefix = format!("{conn_name}.");
+        if let Some((key, db_schema)) = self
+            .database_schemas
+            .iter()
+            .find(|(k, _)| k.starts_with(&prefix))
+        {
+            let db_name = key.strip_prefix(&prefix).unwrap_or(&db_schema.name);
+            return Some((db_name.to_string(), schema));
+        }
+
+        // Fallback: use connection name
+        Some((conn_name.clone(), schema))
     }
 
     /// Returns available schema names for the active connection.
@@ -242,10 +366,51 @@ impl DatabasePanel {
         let Some(conn_name) = &self.active_query_connection else {
             return vec![];
         };
-        let Some(db_schema) = self.schemas.get(conn_name) else {
+
+        // Try flat schemas first (SQLite)
+        if let Some(db_schema) = self.schemas.get(conn_name) {
+            let mut schemas: Vec<String> = db_schema
+                .tables
+                .iter()
+                .map(|t| t.schema.clone())
+                .chain(db_schema.views.iter().map(|v| v.schema.clone()))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            schemas.sort();
+            return schemas;
+        }
+
+        // For multi-database providers, collect schemas from all loaded database_schemas
+        let prefix = format!("{conn_name}.");
+        let mut schemas: HashSet<String> = HashSet::new();
+        for (key, db_schema) in &self.database_schemas {
+            if key.starts_with(&prefix) {
+                for table in &db_schema.tables {
+                    schemas.insert(table.schema.clone());
+                }
+                for view in &db_schema.views {
+                    schemas.insert(view.schema.clone());
+                }
+            }
+        }
+        let mut result: Vec<String> = schemas.into_iter().collect();
+        result.sort();
+        result
+    }
+
+    pub fn active_database_name(&self) -> Option<&str> {
+        self.active_query_database.as_deref()
+    }
+
+    pub fn schemas_for_database(&self, database: &str) -> Vec<String> {
+        let Some(conn_name) = &self.active_query_connection else {
             return vec![];
         };
-
+        let key = format!("{conn_name}.{database}");
+        let Some(db_schema) = self.database_schemas.get(&key) else {
+            return vec![];
+        };
         let mut schemas: Vec<String> = db_schema
             .tables
             .iter()
@@ -258,12 +423,56 @@ impl DatabasePanel {
         schemas
     }
 
-    /// Returns the current active schema name.
+    pub fn available_databases(&self) -> Vec<String> {
+        let Some(conn_name) = &self.active_query_connection else {
+            return vec![];
+        };
+        self.database_lists
+            .get(conn_name)
+            .map(|dbs| dbs.iter().map(|d| d.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn is_multi_database(&self) -> bool {
+        let Some(conn_name) = &self.active_query_connection else {
+            return false;
+        };
+        self.connection_capabilities
+            .get(conn_name)
+            .map(|c| c.multi_database)
+            .unwrap_or(false)
+    }
+
+    pub fn set_active_database(&mut self, database: String, cx: &mut Context<Self>) {
+        self.active_query_database = Some(database);
+        self.active_schema = None;
+        cx.notify();
+    }
+
     pub fn active_schema_name(&self) -> Option<&str> {
         self.active_schema.as_deref()
     }
 
-    /// Set the active schema for query execution.
+    pub(crate) fn set_transaction_mode(&mut self, mode: TransactionMode, cx: &mut Context<Self>) {
+        self.transaction_mode = mode;
+        cx.notify();
+    }
+
+    pub(crate) fn set_isolation_level(&mut self, level: IsolationLevel, cx: &mut Context<Self>) {
+        self.isolation_level = level;
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        self.read_only = read_only;
+        cx.notify();
+    }
+
+    pub fn is_in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
     pub fn set_active_schema(&mut self, schema: String, cx: &mut Context<Self>) {
         self.active_schema = Some(schema.clone());
         let arc = self.active_schema_name_for_completions.clone();
@@ -301,7 +510,7 @@ impl DatabasePanel {
         }
     }
 
-    fn load_connections(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn load_connections(&mut self, cx: &mut Context<Self>) {
         let old_connections = std::mem::take(&mut self.connections);
         let mut all_configs = DatabaseConfig { connections: Default::default() };
 
@@ -347,7 +556,7 @@ impl DatabasePanel {
         cx.notify();
     }
 
-    fn connect(&mut self, conn_name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn connect(&mut self, conn_name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.connections.iter_mut().find(|c| c.name == conn_name) else {
             return;
         };
@@ -375,55 +584,80 @@ impl DatabasePanel {
             }
 
             let conn_mgr_clone = conn_manager.clone();
+            let name_for_spawn = name.clone();
             let db_result = Tokio::spawn_result(cx, async move {
                 let mut mgr = conn_mgr_clone.write().await;
                 mgr.test_connection().await?;
-                let schema = mgr.get_schema().await.ok();
-                Ok(schema)
+
+                let caps = mgr.capabilities_for(&name_for_spawn);
+
+                if caps.multi_database {
+                    let databases = mgr.list_databases().await.ok();
+                    let roles = if caps.roles || caps.users {
+                        mgr.list_roles().await.ok()
+                    } else {
+                        None
+                    };
+                    Ok((caps, None, databases, roles))
+                } else {
+                    let schema = mgr.get_schema().await.ok();
+                    Ok((caps, schema, None, None))
+                }
             })
             .await;
 
             match db_result {
-                Ok(schema) => {
+                Ok((caps, schema, databases, roles)) => {
                     let _ = this.update_in(cx, |this, _window, cx| {
                         if let Some(e) = this.connections.iter_mut().find(|c| c.name == name) {
                             e.status = ConnectionStatus::Connected;
                         }
-                        if let Some(s) = schema {
-                            this.schemas.insert(name.clone(), s);
-                        }
+                        this.connection_capabilities.insert(name.clone(), caps.clone());
                         this.expanded_nodes.insert(format!("conn:{name}"));
                         this.active_query_connection = Some(name.clone());
-                        // Set default active schema (prefer "public", fall back to first)
-                        if let Some(schema) = this.schemas.get(&name) {
-                            let schemas: Vec<String> = schema
-                                .tables
-                                .iter()
-                                .map(|t| t.schema.clone())
-                                .chain(schema.views.iter().map(|v| v.schema.clone()))
-                                .collect::<HashSet<_>>()
-                                .into_iter()
-                                .collect();
-                            if schemas.contains(&"public".to_string()) {
-                                this.active_schema = Some("public".to_string());
-                            } else if let Some(first) = schemas.first() {
-                                this.active_schema = Some(first.clone());
+
+                        if caps.multi_database {
+                            if let Some(dbs) = databases {
+                                this.database_lists.insert(name.clone(), dbs);
                             }
-                        }
-                        // Update schema + schema name for SQL completions
-                        if let Some(schema) = this.schemas.get(&name) {
-                            let schema_arc = this.active_schema_for_completions.clone();
-                            let schema_clone = schema.clone();
-                            let name_arc = this.active_schema_name_for_completions.clone();
-                            let active = this.active_schema.clone();
-                            cx.background_executor()
-                                .spawn(async move {
-                                    let mut s = schema_arc.write().await;
-                                    *s = Some(schema_clone);
-                                    let mut n = name_arc.write().await;
-                                    *n = active;
-                                })
-                                .detach();
+                            if let Some(roles) = roles {
+                                this.role_lists.insert(name.clone(), roles);
+                            }
+                        } else {
+                            if let Some(s) = schema {
+                                this.schemas.insert(name.clone(), s);
+                            }
+                            // Set default active schema for non-multi-database providers
+                            if let Some(schema) = this.schemas.get(&name) {
+                                let schemas: Vec<String> = schema
+                                    .tables
+                                    .iter()
+                                    .map(|t| t.schema.clone())
+                                    .chain(schema.views.iter().map(|v| v.schema.clone()))
+                                    .collect::<HashSet<_>>()
+                                    .into_iter()
+                                    .collect();
+                                if schemas.contains(&"public".to_string()) {
+                                    this.active_schema = Some("public".to_string());
+                                } else if let Some(first) = schemas.first() {
+                                    this.active_schema = Some(first.clone());
+                                }
+                            }
+                            // Update schema for SQL completions
+                            if let Some(schema) = this.schemas.get(&name) {
+                                let schema_arc = this.active_schema_for_completions.clone();
+                                let schema_clone = schema.clone();
+                                let name_arc = this.active_schema_name_for_completions.clone();
+                                let active = this.active_schema.clone();
+                                cx.background_executor()
+                                    .spawn(async move {
+                                        let mut s = schema_arc.write().await;
+                                        *s = Some(schema_clone);
+                                        let mut n = name_arc.write().await;
+                                        *n = active;
+                                    })
+                                    .detach();
+                            }
                         }
                         cx.notify();
                     });
@@ -443,11 +677,18 @@ impl DatabasePanel {
         self._pending_task = Some(task);
     }
 
-    fn disconnect(&mut self, conn_name: &str, cx: &mut Context<Self>) {
+    pub(crate) fn disconnect(&mut self, conn_name: &str, cx: &mut Context<Self>) {
         if let Some(e) = self.connections.iter_mut().find(|c| c.name == conn_name) {
             e.status = ConnectionStatus::Disconnected;
         }
         self.schemas.remove(conn_name);
+        self.database_lists.remove(conn_name);
+        self.role_lists.remove(conn_name);
+        self.connection_capabilities.remove(conn_name);
+        // Remove all database_schemas entries for this connection
+        self.database_schemas.retain(|key, _| !key.starts_with(&format!("{conn_name}.")));
+        self.schema_lists.retain(|key, _| !key.starts_with(&format!("{conn_name}.")));
+        self.loading_nodes.retain(|key| !key.contains(conn_name));
         let name = conn_name.to_string();
         let conn_manager = self.connection_manager.clone();
         cx.background_executor()
@@ -459,7 +700,7 @@ impl DatabasePanel {
         cx.notify();
     }
 
-    fn set_active_for_queries(&mut self, conn_name: &str, cx: &mut Context<Self>) {
+    pub(crate) fn set_active_for_queries(&mut self, conn_name: &str, cx: &mut Context<Self>) {
         let is_connected = self
             .connections
             .iter()
@@ -489,7 +730,7 @@ impl DatabasePanel {
         }
     }
 
-    fn toggle_node(&mut self, key: &str, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_node(&mut self, key: &str, cx: &mut Context<Self>) {
         if self.expanded_nodes.contains(key) {
             self.expanded_nodes.remove(key);
         } else {
@@ -499,569 +740,88 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    pub(crate) fn load_database_schema(
+        &mut self,
+        conn_name: &str,
+        db_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let detail_key = format!("{conn_name}.{db_name}");
+        if self.database_schemas.contains_key(&detail_key) || self.loading_nodes.contains(&detail_key) {
+            return;
+        }
+
+        self.loading_nodes.insert(detail_key.clone());
+        cx.notify();
+
+        let conn_manager = self.connection_manager.clone();
+        let name = conn_name.to_string();
+        let db = db_name.to_string();
+
+        let task = cx.spawn_in(window, {
+            let detail_key = detail_key.clone();
+            async move |this, cx| {
+                let conn_mgr = conn_manager.clone();
+                let db_clone = db.clone();
+                let name_clone = name.clone();
+                let result = Tokio::spawn_result(cx, async move {
+                    let mut mgr = conn_mgr.write().await;
+                    mgr.set_active_connection(&name_clone);
+                    mgr.get_schema_for_database(&db_clone).await
+                })
+                .await;
+
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    this.loading_nodes.remove(&detail_key);
+                    if let Ok(schema) = result {
+                        // Update completions if this is the first loaded schema for this connection
+                        let schema_arc = this.active_schema_for_completions.clone();
+                        let name_arc = this.active_schema_name_for_completions.clone();
+                        let schema_clone = schema.clone();
+                        let active = this.active_schema.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                let mut s = schema_arc.write().await;
+                                *s = Some(schema_clone);
+                                let mut n = name_arc.write().await;
+                                *n = active;
+                            })
+                            .detach();
+
+                        // Set default active schema if not set
+                        if this.active_schema.is_none() {
+                            let schemas: Vec<String> = schema
+                                .tables
+                                .iter()
+                                .map(|t| t.schema.clone())
+                                .collect::<HashSet<_>>()
+                                .into_iter()
+                                .collect();
+                            if schemas.contains(&"public".to_string()) {
+                                this.active_schema = Some("public".to_string());
+                            } else if let Some(first) = schemas.first() {
+                                this.active_schema = Some(first.clone());
+                            }
+                        }
+
+                        this.database_schemas.insert(detail_key, schema);
+                    }
+                    cx.notify();
+                });
+            }
+        });
+        self._pending_task = Some(task);
+    }
+
     #[allow(dead_code)]
     fn select_node(&mut self, key: &str, cx: &mut Context<Self>) {
         self.selected_node = Some(key.to_string());
         cx.notify();
     }
 
-    fn open_query_console(
-        &mut self,
-        _conn_name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_sql_editor(None, window, cx);
-    }
-
-    fn query_table(
-        &mut self,
-        schema: &str,
-        table: &str,
-        _conn_name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let query = if schema == "public" {
-            format!("SELECT * FROM {table} LIMIT 100;")
-        } else {
-            format!("SELECT * FROM {schema}.{table} LIMIT 100;")
-        };
-        self.open_sql_editor(Some(query), window, cx);
-    }
-
-    fn show_ddl(
-        &mut self,
-        schema: &str,
-        table: &str,
-        conn_name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Build a CREATE TABLE representation from the cached schema
-        let Some(db_schema) = self.schemas.get(conn_name) else {
-            return;
-        };
-
-        let tbl = db_schema
-            .tables
-            .iter()
-            .find(|t| t.schema == schema && t.name == table);
-        let Some(tbl) = tbl else { return };
-
-        let mut ddl = format!("CREATE TABLE {}.{} (\n", tbl.schema, tbl.name);
-        for (i, col) in tbl.columns.iter().enumerate() {
-            ddl.push_str(&format!("    {} {}", col.name, col.data_type));
-            if !col.is_nullable {
-                ddl.push_str(" NOT NULL");
-            }
-            if let Some(ref def) = col.default_value {
-                ddl.push_str(&format!(" DEFAULT {def}"));
-            }
-            if i < tbl.columns.len() - 1 {
-                ddl.push(',');
-            }
-            ddl.push('\n');
-        }
-
-        // Primary key
-        let pk_cols: Vec<_> = tbl
-            .columns
-            .iter()
-            .filter(|c| c.is_primary_key)
-            .map(|c| c.name.clone())
-            .collect();
-        if !pk_cols.is_empty() {
-            // Remove last newline and add comma
-            if ddl.ends_with('\n') {
-                ddl.pop();
-                if !ddl.ends_with(',') {
-                    ddl.push(',');
-                }
-                ddl.push('\n');
-            }
-            ddl.push_str(&format!(
-                "    PRIMARY KEY ({})\n",
-                pk_cols.join(", ")
-            ));
-        }
-
-        ddl.push_str(");\n");
-
-        // Indexes
-        for idx in &tbl.indexes {
-            if idx.is_primary {
-                continue;
-            }
-            let unique = if idx.is_unique { "UNIQUE " } else { "" };
-            ddl.push_str(&format!(
-                "\nCREATE {unique}INDEX {} ON {}.{} ({});\n",
-                idx.name,
-                tbl.schema,
-                tbl.name,
-                idx.columns.join(", ")
-            ));
-        }
-
-        self.open_sql_editor(Some(ddl), window, cx);
-    }
-
-    fn count_table_rows(
-        &mut self,
-        table_name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let sql = format!("SELECT COUNT(*) as count FROM {table_name}");
-        let conn_manager = self.connection_manager.clone();
-        let weak_workspace = self._workspace.clone();
-        let label = format!("COUNT(*) FROM {table_name}");
-        let schema = self.active_schema.clone();
-
-        let task = cx.spawn_in(window, async move |_this, cx| {
-            let conn_mgr = conn_manager.clone();
-            let result = Tokio::spawn_result(cx, async move {
-                let mut mgr = conn_mgr.write().await;
-                mgr.execute_query_in_schema(&sql, schema.as_deref())
-                    .await
-            })
-            .await;
-
-            let query_result = match result {
-                Ok(qr) => qr,
-                Err(e) => database_core::QueryResult {
-                    columns: vec!["Error".to_string()],
-                    rows: vec![vec![format!("{e:#}")]],
-                    rows_affected: 0,
-                    execution_time_ms: 0,
-                },
-            };
-
-            if let Some(ws) = weak_workspace.upgrade() {
-                let _ = ws.update_in(cx, |workspace, window, cx| {
-                    if let Some(result_panel) = workspace.panel::<DatabaseResultPanel>(cx) {
-                        result_panel.update(cx, |panel, cx| {
-                            panel.push_result(label, query_result, cx);
-                        });
-                        workspace.open_panel::<DatabaseResultPanel>(window, cx);
-                    }
-                });
-            }
-        });
-
-        self._pending_task = Some(task);
-    }
-
-    fn open_sql_editor(
-        &mut self,
-        initial_text: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace) = self._workspace.upgrade() else {
-            return;
-        };
-
-        let schema = self.active_schema_for_completions.clone();
-        let schema_name = self.active_schema_name_for_completions.clone();
-
-        workspace.update(cx, |workspace, cx| {
-            let project = workspace.project().clone();
-            let languages = project.read(cx).languages().clone();
-
-            let buffer = cx.new(|cx| {
-                language::Buffer::local(
-                    initial_text.as_deref().unwrap_or(""),
-                    cx,
-                )
-            });
-
-            let editor = cx.new(|cx| {
-                let mut editor =
-                    Editor::for_buffer(buffer.clone(), Some(project), window, cx);
-                editor.buffer().update(cx, |mb, cx| {
-                    mb.set_title("console".to_string(), cx);
-                });
-                let provider = SqlCompletionProvider::new(schema, schema_name);
-                editor.set_completion_provider(Some(std::rc::Rc::new(provider)));
-                editor
-            });
-
-            // Subscribe to buffer edits for SQL diagnostics
-            let diag_buffer = buffer.clone();
-            cx.subscribe(&buffer, move |_workspace, _buf, event, cx| {
-                if matches!(event, language::BufferEvent::Edited { .. }) {
-                    crate::sql_diagnostics::update_sql_diagnostics(&diag_buffer, cx);
-                }
-            })
-            .detach();
-
-            workspace.add_item_to_active_pane(
-                Box::new(editor),
-                None,
-                true,
-                window,
-                cx,
-            );
-
-            // Set SQL language asynchronously (syntax highlighting)
-            let sql_lang_task = languages.language_for_name("SQL");
-            cx.spawn_in(window, async move |_ws, cx| {
-                if let Ok(sql_lang) = sql_lang_task.await {
-                    let _ = buffer.update_in(cx, |buf, _window, cx| {
-                        buf.set_language(Some(sql_lang), cx);
-                    });
-                }
-            })
-            .detach();
-        });
-    }
-
-    // ── Connection form ─────────────────────────────────────────────
-
-    fn show_connection_form(
-        &mut self,
-        editing: Option<String>,
-        scope: ConnectionScope,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let base_path = match scope {
-            ConnectionScope::Global => Some(self.global_path.clone()),
-            ConnectionScope::Project => self.project_path.clone(),
-        };
-
-        let (name_val, host_val, port_val, db_val, user_val, provider_val) =
-            if let Some(ref edit_name) = editing {
-                let config = base_path
-                    .as_ref()
-                    .and_then(|p| DatabaseConfig::load_from_workspace(p).ok());
-                let conn = config.as_ref().and_then(|c| c.connections.get(edit_name));
-                match conn {
-                    Some(c) => (
-                        edit_name.clone(),
-                        c.host.clone().unwrap_or_default(),
-                        c.port.map(|p| p.to_string()).unwrap_or_default(),
-                        c.database.clone().unwrap_or_default(),
-                        c.user.clone().unwrap_or_default(),
-                        c.provider.clone(),
-                    ),
-                    None => return,
-                }
-            } else {
-                (String::new(), String::new(), String::new(), String::new(), String::new(), "postgres".into())
-            };
-
-        let default_port = PROVIDERS
-            .iter()
-            .find(|(id, _, _)| *id == provider_val)
-            .map(|(_, _, p)| *p)
-            .unwrap_or("5432");
-
-        let make_editor =
-            |cx: &mut Context<Self>, window: &mut Window, placeholder: &str, value: &str| {
-                cx.new(|cx| {
-                    let mut e = Editor::single_line(window, cx);
-                    e.set_placeholder_text(placeholder, window, cx);
-                    if !value.is_empty() {
-                        e.set_text(value, window, cx);
-                    }
-                    e
-                })
-            };
-
-        self.conn_form = Some(ConnectionForm {
-            name_editor: make_editor(cx, window, "my_database", &name_val),
-            host_editor: make_editor(cx, window, "localhost", &host_val),
-            port_editor: make_editor(cx, window, default_port, &port_val),
-            database_editor: make_editor(cx, window, "mydb", &db_val),
-            user_editor: make_editor(cx, window, "postgres", &user_val),
-            password_editor: make_editor(cx, window, "stored in OS keychain", ""),
-            provider: provider_val,
-            scope,
-            editing,
-            error_message: None,
-            test_status: None,
-        });
-        cx.notify();
-    }
-
-    fn test_form_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ref form) = self.conn_form else {
-            return;
-        };
-
-        let provider = form.provider.clone();
-        let host_raw = form.host_editor.read(cx).text(cx).trim().to_string();
-        let port_raw = form.port_editor.read(cx).text(cx).trim().to_string();
-        let database = form.database_editor.read(cx).text(cx).trim().to_string();
-        let user_raw = form.user_editor.read(cx).text(cx).trim().to_string();
-        let password = form.password_editor.read(cx).text(cx).trim().to_string();
-
-        let default_port = PROVIDERS
-            .iter()
-            .find(|(id, _, _)| *id == provider)
-            .map(|(_, _, p)| *p)
-            .unwrap_or("5432");
-        let default_user = if provider == "mysql" || provider == "mariadb" { "root" } else { "postgres" };
-
-        let host = if host_raw.is_empty() { "localhost".to_string() } else { host_raw };
-        let port = if port_raw.is_empty() { default_port.to_string() } else { port_raw };
-        let user = if user_raw.is_empty() { default_user.to_string() } else { user_raw };
-
-        if database.is_empty() {
-            if let Some(ref mut f) = self.conn_form {
-                f.test_status = Some(TestStatus::Failed("Database is required".into()));
-            }
-            cx.notify();
-            return;
-        }
-
-        if let Some(ref mut f) = self.conn_form {
-            f.test_status = Some(TestStatus::Testing);
-        }
-        cx.notify();
-
-        // Build a temporary ConnectionConfig to test
-        let config = database_core::ConnectionConfig {
-            provider: provider.clone(),
-            host: if host.is_empty() { None } else { Some(host) },
-            port: port.parse().ok(),
-            database: Some(database),
-            user: if user.is_empty() { None } else { Some(user) },
-            password_env: None,
-            connection_string_env: None,
-            ssl: Some(false),
-            default: None,
-        };
-
-        let url = match config.connection_url_with_password(
-            if password.is_empty() { None } else { Some(&password) },
-        ) {
-            Ok(u) => u,
-            Err(e) => {
-                if let Some(ref mut f) = self.conn_form {
-                    f.test_status = Some(TestStatus::Failed(format!("{e:#}")));
-                }
-                cx.notify();
-                return;
-            }
-        };
-
-        let provider_box = database_core::providers::get_provider(&provider);
-        let Some(provider_impl) = provider_box else {
-            if let Some(ref mut f) = self.conn_form {
-                f.test_status = Some(TestStatus::Failed("Unknown provider".into()));
-            }
-            cx.notify();
-            return;
-        };
-
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let result = Tokio::spawn_result(cx, async move {
-                provider_impl.test_connection(&url).await
-            })
-            .await;
-
-            let _ = this.update_in(cx, |this, _w, cx| {
-                if let Some(ref mut f) = this.conn_form {
-                    f.test_status = Some(match result {
-                        Ok(()) => TestStatus::Success,
-                        Err(e) => TestStatus::Failed(format!("{e:#}")),
-                    });
-                }
-                cx.notify();
-            });
-        });
-
-        self._pending_task = Some(task);
-    }
-
-    fn focus_next_form_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ref form) = self.conn_form else { return };
-        let editors = form.editors();
-        let current = editors
-            .iter()
-            .position(|e| e.focus_handle(cx).contains_focused(window, cx));
-        let next = match current {
-            Some(i) => (i + 1) % editors.len(),
-            None => 0,
-        };
-        editors[next].focus_handle(cx).focus(window, cx);
-    }
-
-    fn focus_prev_form_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ref form) = self.conn_form else { return };
-        let editors = form.editors();
-        let current = editors
-            .iter()
-            .position(|e| e.focus_handle(cx).contains_focused(window, cx));
-        let prev = match current {
-            Some(0) | None => editors.len() - 1,
-            Some(i) => i - 1,
-        };
-        editors[prev].focus_handle(cx).focus(window, cx);
-    }
-
-    fn cancel_form(&mut self, cx: &mut Context<Self>) {
-        self.conn_form = None;
-        cx.notify();
-    }
-
-    fn save_form(&mut self, cx: &mut Context<Self>) {
-        let Some(ref form) = self.conn_form else { return };
-
-        let name = form.name_editor.read(cx).text(cx).trim().to_string();
-        let host_raw = form.host_editor.read(cx).text(cx).trim().to_string();
-        let port_raw = form.port_editor.read(cx).text(cx).trim().to_string();
-        let database = form.database_editor.read(cx).text(cx).trim().to_string();
-        let user_raw = form.user_editor.read(cx).text(cx).trim().to_string();
-        let password = form.password_editor.read(cx).text(cx).trim().to_string();
-        let provider = form.provider.clone();
-        let editing = form.editing.clone();
-
-        // Apply defaults for empty fields
-        let default_port = PROVIDERS
-            .iter()
-            .find(|(id, _, _)| *id == provider)
-            .map(|(_, _, p)| *p)
-            .unwrap_or("5432");
-        let default_user = if provider == "mysql" || provider == "mariadb" {
-            "root"
-        } else {
-            "postgres"
-        };
-
-        let host = if host_raw.is_empty() { "localhost".to_string() } else { host_raw };
-        let port = if port_raw.is_empty() { default_port.to_string() } else { port_raw };
-        let user = if user_raw.is_empty() { default_user.to_string() } else { user_raw };
-
-        if name.is_empty() {
-            if let Some(ref mut f) = self.conn_form {
-                f.error_message = Some("Connection name is required".into());
-            }
-            cx.notify();
-            return;
-        }
-        if database.is_empty() {
-            if let Some(ref mut f) = self.conn_form {
-                f.error_message = Some("Database name is required".into());
-            }
-            cx.notify();
-            return;
-        }
-
-        // Save password
-        if !password.is_empty() {
-            let conn_manager = self.connection_manager.clone();
-            let pw = password.clone();
-            let n = name.clone();
-            cx.background_executor()
-                .spawn(async move {
-                    let mut mgr = conn_manager.write().await;
-                    mgr.set_password(&n, pw);
-                })
-                .detach();
-
-            let cred_key = format!("database-panel://{name}");
-            let cred_user = if user.is_empty() { "postgres".to_string() } else { user.clone() };
-            let write_task = cx.write_credentials(&cred_key, &cred_user, password.as_bytes());
-            cx.background_executor()
-                .spawn(async move { let _ = write_task.await; })
-                .detach();
-        }
-
-        let scope = form.scope;
-        let ws_path = match scope {
-            ConnectionScope::Global => self.global_path.clone(),
-            ConnectionScope::Project => match self.project_path.clone() {
-                Some(p) => p,
-                None => {
-                    if let Some(ref mut f) = self.conn_form {
-                        f.error_message = Some("No project open. Use Global scope or open a folder.".into());
-                    }
-                    cx.notify();
-                    return;
-                }
-            },
-        };
-
-        eprintln!("[database_panel] save_form: saving to {ws_path}/.database/connections.toml (scope: {:?})", scope);
-
-        let conn_config = database_core::ConnectionConfig {
-            provider: provider.clone(),
-            host: if host.is_empty() { None } else { Some(host) },
-            port: port.parse().ok(),
-            database: Some(database),
-            user: if user.is_empty() { None } else { Some(user) },
-            password_env: None,
-            connection_string_env: None,
-            ssl: Some(false),
-            default: Some(false),
-        };
-
-        let config_path = std::path::Path::new(&ws_path).join(".database/connections.toml");
-        let mut config = if config_path.exists() {
-            DatabaseConfig::load_from_workspace(&ws_path)
-                .unwrap_or(DatabaseConfig { connections: Default::default() })
-        } else {
-            DatabaseConfig { connections: Default::default() }
-        };
-
-        if let Some(ref old_name) = editing {
-            if old_name != &name {
-                config.connections.remove(old_name);
-                let _ = cx.delete_credentials(&format!("database-panel://{old_name}"));
-            }
-        }
-
-        if config.connections.is_empty() {
-            let mut c = conn_config;
-            c.default = Some(true);
-            config.connections.insert(name, c);
-        } else {
-            config.connections.insert(name, conn_config);
-        }
-
-        let dir = std::path::Path::new(&ws_path).join(".database");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("[database_panel] save_form: failed to create dir: {e}");
-            if let Some(ref mut f) = self.conn_form {
-                f.error_message = Some(format!("Failed to create .database dir: {e}"));
-            }
-            cx.notify();
-            return;
-        }
-        match toml::to_string_pretty(&config) {
-            Ok(content) => {
-                match std::fs::write(&config_path, &content) {
-                    Ok(()) => eprintln!("[database_panel] save_form: saved successfully"),
-                    Err(e) => {
-                        eprintln!("[database_panel] save_form: write failed: {e}");
-                        if let Some(ref mut f) = self.conn_form {
-                            f.error_message = Some(format!("Failed to write: {e}"));
-                        }
-                        cx.notify();
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[database_panel] save_form: serialize failed: {e}");
-                if let Some(ref mut f) = self.conn_form {
-                    f.error_message = Some(format!("Failed to serialize: {e}"));
-                }
-                cx.notify();
-                return;
-            }
-        }
-
-        self.conn_form = None;
-        self.load_connections(cx);
-    }
-
     #[allow(dead_code)]
-    fn delete_connection(&mut self, conn_name: &str, cx: &mut Context<Self>) {
+    pub(crate) fn delete_connection(&mut self, conn_name: &str, cx: &mut Context<Self>) {
         let scope = self.connections.iter().find(|c| c.name == conn_name).map(|c| c.scope).unwrap_or(ConnectionScope::Global);
         let ws_path = match scope {
             ConnectionScope::Global => self.global_path.clone(),
@@ -1082,602 +842,6 @@ impl DatabasePanel {
         self.load_connections(cx);
     }
 
-    // ── Action handlers ─────────────────────────────────────────────
-
-    fn set_context_menu(
-        &mut self,
-        menu: Entity<ContextMenu>,
-        position: Point<Pixels>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let subscription = cx.subscribe_in(
-            &menu,
-            window,
-            |this, _, _: &DismissEvent, window, cx| {
-                if this
-                    .context_menu
-                    .as_ref()
-                    .is_some_and(|m| m.0.focus_handle(cx).contains_focused(window, cx))
-                {
-                    cx.focus_self(window);
-                }
-                this.context_menu.take();
-                cx.notify();
-            },
-        );
-        self.context_menu = Some((menu, position, subscription));
-        cx.notify();
-    }
-
-    fn deploy_new_connection_menu_at(
-        &mut self,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let weak = cx.entity().downgrade();
-
-        let has_project = self.project_path.is_some();
-        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
-            let mut m = menu;
-
-            for &(id, label, _) in PROVIDERS {
-                let w = weak.clone();
-                let id = id.to_string();
-                m = m.entry(format!("{label} (Global)"), None, {
-                    let w = w.clone();
-                    let id = id.clone();
-                    move |window, cx| {
-                        if let Some(panel) = w.upgrade() {
-                            panel.update(cx, |this, cx| {
-                                this.show_connection_form_with_provider(&id, ConnectionScope::Global, window, cx);
-                            });
-                        }
-                    }
-                });
-                if has_project {
-                    m = m.entry(format!("{label} (Project)"), None, {
-                        let w = w.clone();
-                        let id = id.clone();
-                        move |window, cx| {
-                            if let Some(panel) = w.upgrade() {
-                                panel.update(cx, |this, cx| {
-                                    this.show_connection_form_with_provider(&id, ConnectionScope::Project, window, cx);
-                                });
-                            }
-                        }
-                    });
-                }
-            }
-
-            m
-        });
-
-        self.set_context_menu(menu, position, window, cx);
-    }
-
-    fn show_connection_form_with_provider(
-        &mut self,
-        provider: &str,
-        scope: ConnectionScope,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.show_connection_form(None, scope, window, cx);
-        if let Some(ref mut form) = self.conn_form {
-            form.provider = provider.to_string();
-        }
-        cx.notify();
-    }
-
-    fn deploy_connection_context_menu(
-        &mut self,
-        conn_name: String,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let is_connected = self
-            .connections
-            .iter()
-            .find(|c| c.name == conn_name)
-            .map(|c| c.status == ConnectionStatus::Connected)
-            .unwrap_or(false);
-
-        let weak = cx.entity().downgrade();
-
-        let menu = ContextMenu::build(window, cx, {
-            let name = conn_name.clone();
-            move |menu, _, _| {
-                let mut m = menu;
-                if is_connected {
-                    m = m.entry("Open Query Console", None, {
-                        let w = weak.clone();
-                        let n = name.clone();
-                        move |window, cx| {
-                            if let Some(panel) = w.upgrade() {
-                                panel.update(cx, |this, cx| {
-                                    this.open_query_console(&n, window, cx);
-                                });
-                            }
-                        }
-                    });
-                    m = m.separator();
-                    m = m.entry("Refresh Schema", None, {
-                        let w = weak.clone();
-                        let n = name.clone();
-                        move |window, cx| {
-                            if let Some(panel) = w.upgrade() {
-                                panel.update(cx, |this, cx| {
-                                    this.connect(&n, window, cx);
-                                });
-                            }
-                        }
-                    });
-                    m = m.entry("Disconnect", None, {
-                        let w = weak.clone();
-                        let n = name.clone();
-                        move |_window, cx| {
-                            if let Some(panel) = w.upgrade() {
-                                panel.update(cx, |this, cx| {
-                                    this.disconnect(&n, cx);
-                                });
-                            }
-                        }
-                    });
-                } else {
-                    m = m.entry("Connect", None, {
-                        let w = weak.clone();
-                        let n = name.clone();
-                        move |window, cx| {
-                            if let Some(panel) = w.upgrade() {
-                                panel.update(cx, |this, cx| {
-                                    this.connect(&n, window, cx);
-                                });
-                            }
-                        }
-                    });
-                }
-                m = m.separator();
-                m = m.entry("Edit Connection", None, {
-                    let w = weak.clone();
-                    let n = name.clone();
-                    move |window, cx| {
-                        if let Some(panel) = w.upgrade() {
-                            panel.update(cx, |this, cx| {
-                                // Detect scope from existing connection
-                                let scope = this.connections.iter().find(|c| c.name == n).map(|c| c.scope).unwrap_or(ConnectionScope::Global);
-                                this.show_connection_form(Some(n.clone()), scope, window, cx);
-                            });
-                        }
-                    }
-                });
-                m = m.entry("Delete Connection", None, {
-                    let w = weak.clone();
-                    let n = name.clone();
-                    move |_window, cx| {
-                        if let Some(panel) = w.upgrade() {
-                            panel.update(cx, |this, cx| {
-                                this.delete_connection(&n, cx);
-                            });
-                        }
-                    }
-                });
-                m
-            }
-        });
-
-        self.set_context_menu(menu, position, window, cx);
-    }
-
-    fn deploy_table_context_menu(
-        &mut self,
-        schema_name: String,
-        table_name: String,
-        conn_name: String,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let weak = cx.entity().downgrade();
-        let full_name = if schema_name == "public" {
-            table_name.clone()
-        } else {
-            format!("{schema_name}.{table_name}")
-        };
-
-        let menu = ContextMenu::build(window, cx, {
-            let sn = schema_name.clone();
-            let tn = table_name.clone();
-            let cn = conn_name.clone();
-            let fn_ = full_name.clone();
-            move |menu, _, _| {
-                menu.entry("SELECT * FROM ... LIMIT 100", None, {
-                    let w = weak.clone();
-                    let sn = sn.clone();
-                    let tn = tn.clone();
-                    let cn = cn.clone();
-                    move |window, cx| {
-                        if let Some(panel) = w.upgrade() {
-                            panel.update(cx, |this, cx| {
-                                this.query_table(&sn, &tn, &cn, window, cx);
-                            });
-                        }
-                    }
-                })
-                .entry("Show DDL (CREATE TABLE)", None, {
-                    let w = weak.clone();
-                    let sn = sn.clone();
-                    let tn = tn.clone();
-                    let cn = cn.clone();
-                    move |window, cx| {
-                        if let Some(panel) = w.upgrade() {
-                            panel.update(cx, |this, cx| {
-                                this.show_ddl(&sn, &tn, &cn, window, cx);
-                            });
-                        }
-                    }
-                })
-                .entry("Count Rows", None, {
-                    let w = weak.clone();
-                    let fn_ = fn_.clone();
-                    move |window, cx| {
-                        if let Some(panel) = w.upgrade() {
-                            panel.update(cx, |this, cx| {
-                                this.count_table_rows(&fn_, window, cx);
-                            });
-                        }
-                    }
-                })
-                .separator()
-                .entry("Copy Table Name", None, {
-                    let fn_ = fn_.clone();
-                    move |_window, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(fn_.clone()));
-                    }
-                })
-            }
-        });
-
-        self.set_context_menu(menu, position, window, cx);
-    }
-
-    /// Get SQL from the active editor: selected text if any, otherwise the full text.
-    fn get_sql_from_active_editor(&self, cx: &Context<Self>) -> Option<String> {
-        let workspace = self._workspace.upgrade()?;
-        let editor_entity = workspace
-            .read(cx)
-            .active_item(cx)?
-            .act_as::<Editor>(cx)?;
-        let editor = editor_entity.read(cx);
-
-        // Check if there's a non-empty selection via anchors
-        let newest = editor.selections.newest_anchor();
-        if newest.start != newest.end {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let start: multi_buffer::MultiBufferOffset =
-                snapshot.summary_for_anchor(&newest.start);
-            let end: multi_buffer::MultiBufferOffset =
-                snapshot.summary_for_anchor(&newest.end);
-            if start != end {
-                let text: String = snapshot.text_for_range(start..end).collect();
-                let trimmed = text.trim().to_string();
-                if !trimmed.is_empty() {
-                    return Some(trimmed);
-                }
-            }
-        }
-
-        // No selection — use full text
-        let text = editor.text(cx).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    }
-
-    // ── Auto-reconnect helpers ────────────────────────────────────
-
-    /// Check if we need to auto-reconnect and prepare credential reading.
-    /// Returns (connection_name, credential_read_task) if reconnection is needed.
-    fn prepare_reconnect_if_needed(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Option<(String, Task<anyhow::Result<Option<(String, Vec<u8>)>>>)> {
-        let has_active = self
-            .active_query_connection
-            .as_ref()
-            .and_then(|name| self.connections.iter().find(|c| &c.name == name))
-            .is_some_and(|c| c.status == ConnectionStatus::Connected);
-
-        if has_active {
-            return None;
-        }
-
-        // Pick a connection to reconnect to: prefer active_query_connection, else first available
-        let name = self
-            .active_query_connection
-            .clone()
-            .or_else(|| self.connections.first().map(|c| c.name.clone()))?;
-
-        // Mark as connecting in the UI
-        if let Some(entry) = self.connections.iter_mut().find(|c| c.name == name) {
-            entry.status = ConnectionStatus::Connecting;
-        }
-        cx.notify();
-
-        let credential_key = format!("database-panel://{name}");
-        let cred_task = cx.read_credentials(&credential_key);
-
-        Some((name, cred_task))
-    }
-
-    // ── Query execution ─────────────────────────────────────────
-
-    pub fn run_sql(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
-        if sql.is_empty() { return; }
-
-        let reconnect = self.prepare_reconnect_if_needed(cx);
-        let conn_manager = self.connection_manager.clone();
-        let weak_workspace = self._workspace.clone();
-        let query_label = sql.clone();
-        let schema = self.active_schema.clone();
-
-        let task = cx.spawn_in(window, async move |this, cx| {
-            // Phase 1: Auto-reconnect if needed
-            let mut effective_schema = schema;
-            if let Some((name, cred_task)) = reconnect {
-                match Self::do_reconnect(&name, cred_task, &conn_manager, &this, cx).await {
-                    Ok(new_schema) => {
-                        effective_schema = new_schema;
-                    }
-                    Err(e) => {
-                        Self::push_error_result(
-                            &weak_workspace,
-                            query_label,
-                            format!("Auto-reconnect failed: {e:#}"),
-                            cx,
-                        );
-                        return;
-                    }
-                }
-            }
-
-            // Phase 2: Execute the query
-            let conn_mgr = conn_manager.clone();
-            let result = Tokio::spawn_result(cx, async move {
-                let mut mgr = conn_mgr.write().await;
-                mgr.execute_query_in_schema(&sql, effective_schema.as_deref())
-                    .await
-            })
-            .await;
-
-            let query_result = match result {
-                Ok(qr) => qr,
-                Err(e) => database_core::QueryResult {
-                    columns: vec!["Error".to_string()],
-                    rows: vec![vec![format!("{e:#}")]],
-                    rows_affected: 0,
-                    execution_time_ms: 0,
-                },
-            };
-
-            Self::push_query_result(&weak_workspace, query_label, query_result, cx);
-        });
-        self._pending_task = Some(task);
-    }
-
-    pub fn explain_sql(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
-        if sql.is_empty() { return; }
-
-        let reconnect = self.prepare_reconnect_if_needed(cx);
-        let conn_manager = self.connection_manager.clone();
-        let weak_workspace = self._workspace.clone();
-        let query_label = format!("EXPLAIN {}", &sql[..sql.len().min(40)]);
-        let schema = self.active_schema.clone();
-
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let mut effective_schema = schema;
-            if let Some((name, cred_task)) = reconnect {
-                match Self::do_reconnect(&name, cred_task, &conn_manager, &this, cx).await {
-                    Ok(new_schema) => {
-                        effective_schema = new_schema;
-                    }
-                    Err(e) => {
-                        Self::push_error_result(
-                            &weak_workspace,
-                            query_label,
-                            format!("Auto-reconnect failed: {e:#}"),
-                            cx,
-                        );
-                        return;
-                    }
-                }
-            }
-
-            let conn_mgr = conn_manager.clone();
-            let result = Tokio::spawn_result(cx, async move {
-                let mut mgr = conn_mgr.write().await;
-                mgr.explain_query_in_schema(&sql, effective_schema.as_deref())
-                    .await
-            })
-            .await;
-
-            let query_result = match result {
-                Ok(plan) => database_core::QueryResult {
-                    columns: vec!["QUERY PLAN".to_string()],
-                    rows: plan.lines().filter(|l| !l.is_empty()).map(|l| vec![l.to_string()]).collect(),
-                    rows_affected: 0,
-                    execution_time_ms: 0,
-                },
-                Err(e) => database_core::QueryResult {
-                    columns: vec!["Error".to_string()],
-                    rows: vec![vec![format!("{e:#}")]],
-                    rows_affected: 0,
-                    execution_time_ms: 0,
-                },
-            };
-
-            Self::push_query_result(&weak_workspace, query_label, query_result, cx);
-        });
-        self._pending_task = Some(task);
-    }
-
-    pub fn run_query_from_editor(
-        &mut self,
-        _: &RunQuery,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(sql) = self.get_sql_from_active_editor(cx) {
-            let sql = sql.trim().to_string();
-            if !sql.is_empty() {
-                self.run_sql(sql, window, cx);
-            }
-        }
-    }
-
-    pub fn explain_query_from_editor(
-        &mut self,
-        _: &ExplainQuery,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(sql) = self.get_sql_from_active_editor(cx) {
-            let sql = sql.trim().to_string();
-            if !sql.is_empty() {
-                self.explain_sql(sql, window, cx);
-            }
-        }
-    }
-
-    /// Perform auto-reconnect: read keychain password, connect, fetch schema.
-    /// Returns the active schema on success.
-    async fn do_reconnect(
-        name: &str,
-        cred_task: Task<anyhow::Result<Option<(String, Vec<u8>)>>>,
-        conn_manager: &Arc<RwLock<ConnectionManager>>,
-        this: &gpui::WeakEntity<Self>,
-        cx: &mut AsyncWindowContext,
-    ) -> anyhow::Result<Option<String>> {
-        let keychain_password = cred_task
-            .await
-            .ok()
-            .flatten()
-            .and_then(|(_, pw_bytes)| String::from_utf8(pw_bytes).ok());
-
-        {
-            let mut mgr = conn_manager.write().await;
-            mgr.set_active_connection(name);
-            if let Some(ref pw) = keychain_password {
-                mgr.set_password(name, pw.clone());
-            }
-        }
-
-        let conn_mgr_clone = conn_manager.clone();
-        let db_result: anyhow::Result<Option<DatabaseSchema>> =
-            Tokio::spawn_result(cx, async move {
-                let mut mgr = conn_mgr_clone.write().await;
-                mgr.test_connection().await?;
-                let schema = mgr.get_schema().await.ok();
-                Ok(schema)
-            })
-            .await;
-
-        let db_schema = db_result?;
-        let name_owned = name.to_string();
-
-        let active_schema = this
-            .update_in(cx, |panel, _window, cx| {
-                if let Some(e) = panel.connections.iter_mut().find(|c| c.name == name_owned) {
-                    e.status = ConnectionStatus::Connected;
-                }
-                if let Some(s) = db_schema {
-                    panel.schemas.insert(name_owned.clone(), s);
-                }
-                panel.expanded_nodes.insert(format!("conn:{name_owned}"));
-                panel.active_query_connection = Some(name_owned.clone());
-
-                // Set default active schema
-                if let Some(schema) = panel.schemas.get(&name_owned) {
-                    let schema_names: Vec<String> = schema
-                        .tables
-                        .iter()
-                        .map(|t| t.schema.clone())
-                        .chain(schema.views.iter().map(|v| v.schema.clone()))
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    if schema_names.contains(&"public".to_string()) {
-                        panel.active_schema = Some("public".to_string());
-                    } else if let Some(first) = schema_names.first() {
-                        panel.active_schema = Some(first.clone());
-                    }
-                }
-
-                // Update completions
-                if let Some(schema) = panel.schemas.get(&name_owned) {
-                    let schema_arc = panel.active_schema_for_completions.clone();
-                    let schema_clone = schema.clone();
-                    let name_arc = panel.active_schema_name_for_completions.clone();
-                    let active = panel.active_schema.clone();
-                    cx.background_executor()
-                        .spawn(async move {
-                            let mut s = schema_arc.write().await;
-                            *s = Some(schema_clone);
-                            let mut n = name_arc.write().await;
-                            *n = active;
-                        })
-                        .detach();
-                }
-
-                let result = panel.active_schema.clone();
-                cx.notify();
-                result
-            })
-            .ok()
-            .flatten();
-
-        Ok(active_schema)
-    }
-
-    /// Push a query result to the result panel.
-    fn push_query_result(
-        weak_workspace: &WeakEntity<Workspace>,
-        label: String,
-        result: database_core::QueryResult,
-        cx: &mut AsyncWindowContext,
-    ) {
-        if let Some(ws) = weak_workspace.upgrade() {
-            let _ = ws.update_in(cx, |workspace, window, cx| {
-                if let Some(result_panel) = workspace.panel::<DatabaseResultPanel>(cx) {
-                    result_panel.update(cx, |panel, cx| {
-                        panel.push_result(label, result, cx);
-                    });
-                    workspace.open_panel::<DatabaseResultPanel>(window, cx);
-                }
-            });
-        }
-    }
-
-    /// Push an error message to the result panel.
-    fn push_error_result(
-        weak_workspace: &WeakEntity<Workspace>,
-        label: String,
-        error: String,
-        cx: &mut AsyncWindowContext,
-    ) {
-        let err_result = database_core::QueryResult {
-            columns: vec!["Error".to_string()],
-            rows: vec![vec![error]],
-            rows_affected: 0,
-            execution_time_ms: 0,
-        };
-        Self::push_query_result(weak_workspace, label, err_result, cx);
-    }
-
     fn close(&mut self, _: &Close, _window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(PanelEvent::Close);
     }
@@ -1688,849 +852,6 @@ impl DatabasePanel {
 
     fn new_connection_action(&mut self, _: &NewConnection, window: &mut Window, cx: &mut Context<Self>) {
         self.show_connection_form(None, ConnectionScope::Global, window, cx);
-    }
-
-    // ── Render: Toolbar ─────────────────────────────────────────────
-
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_conn = self.active_query_connection.as_ref().and_then(|name| {
-            self.connections.iter().find(|c| c.name == *name && c.status == ConnectionStatus::Connected)
-        }).or_else(|| {
-            self.connections.iter().find(|c| c.status == ConnectionStatus::Connected)
-        });
-
-        let title_label: SharedString = match active_conn {
-            Some(c) => format!("{}@{}", c.name, c.host).into(),
-            None => "Database".into(),
-        };
-        let title_color = if active_conn.is_some() {
-            Color::Success
-        } else {
-            Color::Accent
-        };
-
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .overflow_hidden()
-                    .child(
-                        Icon::new(IconName::DatabaseZap)
-                            .size(IconSize::Small)
-                            .color(title_color),
-                    )
-                    .child(
-                        Label::new(title_label)
-                            .size(LabelSize::Small)
-                            .weight(FontWeight::SEMIBOLD)
-                            .color(title_color),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_0()
-                    .child(
-                        IconButton::new("add_conn", IconName::Plus)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(|_w, cx| Tooltip::simple("New Connection", cx))
-                            .on_click(cx.listener(|this, event, window, cx| {
-                                let position = match event {
-                                    gpui::ClickEvent::Mouse(e) => e.down.position,
-                                    gpui::ClickEvent::Keyboard(_) => gpui::point(px(0.), px(30.)),
-                                };
-                                this.deploy_new_connection_menu_at(position, window, cx);
-                            })),
-                    )
-                    .child(
-                        IconButton::new("refresh", IconName::RotateCw)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(|_w, cx| Tooltip::simple("Refresh", cx))
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.load_connections(cx);
-                            })),
-                    ),
-            )
-    }
-
-    // ── Render: Search bar ────────────────────────────────────────────
-
-    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_connections = self
-            .connections
-            .iter()
-            .any(|c| c.status == ConnectionStatus::Connected);
-
-        if !has_connections || self.conn_form.is_some() {
-            return div().into_any_element();
-        }
-
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(Icon::new(IconName::MagnifyingGlass).size(IconSize::XSmall).color(Color::Muted))
-            .child(div().flex_1().child(self.search_editor.clone()))
-            .when(!self.search_filter.is_empty(), |d| {
-                d.child(
-                    IconButton::new("clear-search", IconName::Close)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.search_editor.update(cx, |editor, cx| {
-                                editor.set_text("", window, cx);
-                            });
-                            this.search_filter.clear();
-                            cx.notify();
-                        })),
-                )
-            })
-            .into_any_element()
-    }
-
-    // ── Render: Tree view ───────────────────────────────────────────
-
-    fn render_tree(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.conn_form.is_some() {
-            return self.render_form(cx);
-        }
-
-        if self.connections.is_empty() {
-            return self.render_empty_state(cx);
-        }
-
-        let global_conns: Vec<_> = self.connections.iter().filter(|c| c.scope == ConnectionScope::Global).collect();
-        let project_conns: Vec<_> = self.connections.iter().filter(|c| c.scope == ConnectionScope::Project).collect();
-
-        let mut tree = div().flex().flex_col().w_full();
-
-        // Global section
-        if !global_conns.is_empty() {
-            tree = tree.child(
-                div().px_3().py_1().child(
-                    Label::new("Global Data Sources")
-                        .size(LabelSize::XSmall)
-                        .weight(FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
-                ),
-            );
-            for conn in &global_conns {
-                tree = tree.child(self.render_connection_node(conn, cx));
-            }
-        }
-
-        // Project section
-        if !project_conns.is_empty() {
-            tree = tree.child(
-                div().px_3().py_1().mt_1().child(
-                    Label::new("Project Data Sources")
-                        .size(LabelSize::XSmall)
-                        .weight(FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
-                ),
-            );
-            for conn in &project_conns {
-                tree = tree.child(self.render_connection_node(conn, cx));
-            }
-        }
-
-        div()
-            .id("db-tree-scroll")
-            .flex_1()
-            .overflow_y_scroll()
-            .child(tree)
-            .into_any_element()
-    }
-
-    fn render_connection_node(&self, conn: &ConnectionEntry, cx: &mut Context<Self>) -> impl IntoElement {
-        let conn_key = format!("conn:{}", conn.name);
-        let is_expanded = self.expanded_nodes.contains(&conn_key);
-        let is_selected = self.selected_node.as_ref() == Some(&conn_key);
-        let is_connected = conn.status == ConnectionStatus::Connected;
-        let is_connecting = conn.status == ConnectionStatus::Connecting;
-        let is_active_query = self
-            .active_query_connection
-            .as_ref()
-            .map(|n| n == &conn.name)
-            .unwrap_or(false)
-            && is_connected;
-
-        let (status_icon, status_color) = match &conn.status {
-            ConnectionStatus::Disconnected => (IconName::Circle, Color::Muted),
-            ConnectionStatus::Connecting => (IconName::ArrowCircle, Color::Warning),
-            ConnectionStatus::Connected => (IconName::DatabaseZap, Color::Success),
-            ConnectionStatus::Error(_) => (IconName::Close, Color::Error),
-        };
-
-        let name = conn.name.clone();
-        let display: SharedString = format!("{}@{}", conn.name, conn.host).into();
-
-        let mut node = div().flex().flex_col().w_full();
-
-        // Connection header row
-        node = node.child(
-            div()
-                .id(ElementId::Name(conn_key.clone().into()))
-                .flex()
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .cursor_pointer()
-                .when(is_selected, |d| d.bg(cx.theme().colors().ghost_element_selected).rounded_md())
-                .hover(|d| d.bg(cx.theme().colors().ghost_element_hover).rounded_md())
-                .on_click(cx.listener({
-                    let key = conn_key.clone();
-                    let name = name.clone();
-                    move |this, _, window, cx| {
-                        if this.expanded_nodes.contains(&key) {
-                            this.expanded_nodes.remove(&key);
-                        } else {
-                            this.expanded_nodes.insert(key.clone());
-                            let status = this.connections.iter().find(|c| c.name == name).map(|c| &c.status);
-                            if matches!(status, Some(ConnectionStatus::Disconnected) | Some(ConnectionStatus::Error(_))) {
-                                this.connect(&name, window, cx);
-                            }
-                        }
-                        // Set as active connection for queries
-                        this.set_active_for_queries(&name, cx);
-                        this.selected_node = Some(key.clone());
-                        cx.notify();
-                    }
-                }))
-                .on_mouse_down(MouseButton::Right, cx.listener({
-                    let name = name.clone();
-                    move |this, event: &MouseDownEvent, window, cx| {
-                        this.deploy_connection_context_menu(
-                            name.clone(),
-                            event.position,
-                            window,
-                            cx,
-                        );
-                    }
-                }))
-                .child(
-                    Icon::new(if is_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(Icon::new(status_icon).size(IconSize::XSmall).color(status_color))
-                .child(
-                    Label::new(display)
-                        .size(LabelSize::Small)
-                        .weight(if is_active_query { FontWeight::BOLD } else { FontWeight::NORMAL }),
-                )
-                // Action buttons on hover/selection
-                .when(is_connected, |d| {
-                    let name = name.clone();
-                    d.child(div().flex_1()).child(
-                        div().flex().gap_0()
-                            .child(
-                                IconButton::new(
-                                    ElementId::Name(format!("console-{name}").into()),
-                                    IconName::Terminal,
-                                )
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(|_w, cx| Tooltip::simple("Open Query Console", cx))
-                                .on_click(cx.listener({
-                                    let name = name.clone();
-                                    move |this, _, window, cx| {
-                                        this.open_query_console(&name, window, cx);
-                                    }
-                                })),
-                            )
-                            .child(
-                                IconButton::new(
-                                    ElementId::Name(format!("disconnect-{name}").into()),
-                                    IconName::Close,
-                                )
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(|_w, cx| Tooltip::simple("Disconnect", cx))
-                                .on_click(cx.listener({
-                                    let name = name.clone();
-                                    move |this, _, _w, cx| {
-                                        this.disconnect(&name, cx);
-                                    }
-                                })),
-                            ),
-                    )
-                }),
-        );
-
-        // Error message
-        if let ConnectionStatus::Error(ref msg) = conn.status {
-            node = node.child(
-                div().pl(px(28.)).pr_2().child(
-                    Label::new(msg.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Error),
-                ),
-            );
-        }
-
-        // Expanded: show schema
-        if is_expanded && is_connected {
-            if let Some(schema) = self.schemas.get(&conn.name) {
-                node = node.child(self.render_schema_tree(schema, &conn.name, cx));
-            }
-        }
-
-        // Connecting indicator
-        if is_connecting {
-            node = node.child(
-                div().pl(px(28.)).child(
-                    Label::new("Connecting...")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warning),
-                ),
-            );
-        }
-
-        node
-    }
-
-    fn render_schema_tree(
-        &self,
-        schema: &DatabaseSchema,
-        conn_name: &str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let mut tree = div().flex().flex_col().w_full();
-
-        // Tables
-        if !schema.tables.is_empty() {
-            let tables_key = format!("tables:{conn_name}");
-            let tables_expanded = self.expanded_nodes.contains(&tables_key);
-
-            tree = tree.child(self.render_tree_section(
-                &tables_key,
-                &format!("Tables ({})", schema.tables.len()),
-                IconName::ListTree,
-                tables_expanded,
-                1,
-                cx,
-            ));
-
-            if tables_expanded {
-                let filter = &self.search_filter;
-                for table in &schema.tables {
-                    if !filter.is_empty()
-                        && !table.name.to_lowercase().contains(filter)
-                    {
-                        continue;
-                    }
-                    let tbl_key = format!("tbl:{conn_name}.{}.{}", table.schema, table.name);
-                    let tbl_expanded = self.expanded_nodes.contains(&tbl_key);
-                    tree = tree.child(self.render_table_node(table, &tbl_key, tbl_expanded, conn_name, cx));
-                }
-            }
-        }
-
-        // Views
-        if !schema.views.is_empty() {
-            let views_key = format!("views:{conn_name}");
-            let views_expanded = self.expanded_nodes.contains(&views_key);
-
-            tree = tree.child(self.render_tree_section(
-                &views_key,
-                &format!("Views ({})", schema.views.len()),
-                IconName::Eye,
-                views_expanded,
-                1,
-                cx,
-            ));
-
-            if views_expanded {
-                let filter = &self.search_filter;
-                for view in &schema.views {
-                    if !filter.is_empty()
-                        && !view.name.to_lowercase().contains(filter)
-                    {
-                        continue;
-                    }
-                    let v_key = format!("view:{conn_name}.{}.{}", view.schema, view.name);
-                    let v_expanded = self.expanded_nodes.contains(&v_key);
-                    tree = tree.child(self.render_view_node(view, &v_key, v_expanded, cx));
-                }
-            }
-        }
-
-        tree
-    }
-
-    fn render_tree_section(
-        &self,
-        key: &str,
-        label: &str,
-        icon: IconName,
-        is_expanded: bool,
-        indent: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.selected_node.as_ref().map(|s| s.as_str()) == Some(key);
-        let pl = px((indent * 16 + 8) as f32);
-
-        div()
-            .id(ElementId::Name(key.to_string().into()))
-            .flex()
-            .items_center()
-            .gap_1()
-            .pl(pl)
-            .pr_2()
-            .py_px()
-            .cursor_pointer()
-            .when(is_selected, |d| d.bg(cx.theme().colors().ghost_element_selected).rounded_md())
-            .hover(|d| d.bg(cx.theme().colors().ghost_element_hover).rounded_md())
-            .on_click(cx.listener({
-                let key = key.to_string();
-                move |this, _, _w, cx| { this.toggle_node(&key, cx); }
-            }))
-            .child(
-                Icon::new(if is_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Accent))
-            .child(Label::new(label.to_string()).size(LabelSize::XSmall))
-    }
-
-    fn render_table_node(
-        &self,
-        table: &Table,
-        key: &str,
-        is_expanded: bool,
-        conn_name: &str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.selected_node.as_ref().map(|s| s.as_str()) == Some(key);
-
-        let mut node = div().flex().flex_col().w_full();
-
-        // Table row
-        node = node.child(
-            div()
-                .id(ElementId::Name(key.to_string().into()))
-                .flex()
-                .items_center()
-                .gap_1()
-                .pl(px(40.))
-                .pr_2()
-                .py_px()
-                .cursor_pointer()
-                .when(is_selected, |d| d.bg(cx.theme().colors().ghost_element_selected).rounded_md())
-                .hover(|d| d.bg(cx.theme().colors().ghost_element_hover).rounded_md())
-                .on_click(cx.listener({
-                    let key = key.to_string();
-                    move |this, _, _w, cx| { this.toggle_node(&key, cx); }
-                }))
-                .on_mouse_down(MouseButton::Right, cx.listener({
-                    let s = table.schema.clone();
-                    let t = table.name.clone();
-                    let cn = conn_name.to_string();
-                    move |this, event: &MouseDownEvent, window, cx| {
-                        this.deploy_table_context_menu(
-                            s.clone(), t.clone(), cn.clone(),
-                            event.position, window, cx,
-                        );
-                    }
-                }))
-                .child(
-                    Icon::new(if is_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(Icon::new(IconName::FileTextOutlined).size(IconSize::XSmall).color(Color::Accent))
-                .child(Label::new(table.name.clone()).size(LabelSize::XSmall))
-                .child(div().flex_1())
-                .child({
-                    let schema = table.schema.clone();
-                    let table_name = table.name.clone();
-                    let cn = conn_name.to_string();
-                    IconButton::new(
-                        ElementId::Name(format!("q-{key}").into()),
-                        IconName::PlayFilled,
-                    )
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .tooltip(|_w, cx| Tooltip::simple("SELECT * FROM ...", cx))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.query_table(&schema, &table_name, &cn, window, cx);
-                    }))
-                }),
-        );
-
-        // Columns
-        if is_expanded {
-            for col in &table.columns {
-                node = node.child(self.render_column_row(col, 56));
-            }
-        }
-
-        node
-    }
-
-    fn render_view_node(
-        &self,
-        view: &View,
-        key: &str,
-        is_expanded: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.selected_node.as_ref().map(|s| s.as_str()) == Some(key);
-
-        let mut node = div().flex().flex_col().w_full();
-
-        node = node.child(
-            div()
-                .id(ElementId::Name(key.to_string().into()))
-                .flex()
-                .items_center()
-                .gap_1()
-                .pl(px(40.))
-                .pr_2()
-                .py_px()
-                .cursor_pointer()
-                .when(is_selected, |d| d.bg(cx.theme().colors().ghost_element_selected).rounded_md())
-                .hover(|d| d.bg(cx.theme().colors().ghost_element_hover).rounded_md())
-                .on_click(cx.listener({
-                    let key = key.to_string();
-                    move |this, _, _w, cx| { this.toggle_node(&key, cx); }
-                }))
-                .child(
-                    Icon::new(if is_expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(Color::Warning))
-                .child(Label::new(view.name.clone()).size(LabelSize::XSmall)),
-        );
-
-        if is_expanded {
-            for col in &view.columns {
-                node = node.child(self.render_column_row(col, 56));
-            }
-        }
-
-        node
-    }
-
-    fn render_column_row(&self, col: &database_core::DbColumn, indent_px: i32) -> impl IntoElement {
-        let mut badges: Vec<&str> = Vec::new();
-        if col.is_primary_key { badges.push("PK"); }
-        if col.foreign_key.is_some() { badges.push("FK"); }
-        if !col.is_nullable { badges.push("NOT NULL"); }
-
-        let mut row = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .pl(px(indent_px as f32))
-            .pr_2()
-            .py_px()
-            .child(Icon::new(IconName::Dash).size(IconSize::XSmall).color(Color::Muted))
-            .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
-            .child(
-                Label::new(col.data_type.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-
-        for badge in badges {
-            row = row.child(
-                div().px_1().rounded_sm().bg(gpui::rgb(0x2a2a3a)).child(
-                    Label::new(badge).size(LabelSize::XSmall).color(Color::Accent),
-                ),
-            );
-        }
-
-        row
-    }
-
-    // ── Render: Empty state ─────────────────────────────────────────
-
-    fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .flex_1()
-            .gap_3()
-            .p_4()
-            .child(Icon::new(IconName::DatabaseZap).size(IconSize::Medium).color(Color::Muted))
-            .child(Label::new("No connections").size(LabelSize::Small).color(Color::Muted))
-            .child(Label::new("Add a connection to get started").size(LabelSize::XSmall).color(Color::Muted))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .w(px(200.))
-                    .child(
-                        Button::new("add_pg", "PostgreSQL")
-                            .full_width()
-                            .style(ButtonStyle::Filled)
-                            .start_icon(Icon::new(IconName::DatabaseZap).size(IconSize::Small))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_connection_form_with_provider("postgres", ConnectionScope::Global, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("add_mysql", "MySQL")
-                            .full_width()
-                            .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::DatabaseZap).size(IconSize::Small))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_connection_form_with_provider("mysql", ConnectionScope::Global, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("add_sqlite", "SQLite")
-                            .full_width()
-                            .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::DatabaseZap).size(IconSize::Small))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_connection_form_with_provider("sqlite", ConnectionScope::Global, window, cx);
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    // ── Render: Connection form ─────────────────────────────────────
-
-    fn render_form(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(ref form) = self.conn_form else {
-            return div().into_any_element();
-        };
-
-        let is_sqlite = form.provider == "sqlite" || form.provider == "sqlite3";
-        let title = if form.editing.is_some() { "Edit Connection" } else { "New Connection" };
-        let title_icon = if form.editing.is_some() { IconName::Settings } else { IconName::Plus };
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .key_context("DatabaseConnectionForm")
-            .on_action(cx.listener(|this, _: &FocusNextField, window, cx| {
-                this.focus_next_form_field(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &FocusPrevField, window, cx| {
-                this.focus_prev_form_field(window, cx);
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .child(
-                        div().flex().items_center().gap_2()
-                            .child(Icon::new(title_icon).size(IconSize::Small).color(Color::Accent))
-                            .child(Label::new(title).size(LabelSize::Small).weight(FontWeight::SEMIBOLD)),
-                    )
-                    // Provider badge
-                    .child({
-                        let provider_label = PROVIDERS
-                            .iter()
-                            .find(|(id, _, _)| *id == form.provider)
-                            .map(|(_, label, _)| *label)
-                            .unwrap_or("Unknown");
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(cx.theme().colors().ghost_element_hover)
-                            .child(
-                                Icon::new(IconName::DatabaseZap)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Accent),
-                            )
-                            .child(
-                                Label::new(provider_label)
-                                    .size(LabelSize::XSmall)
-                                    .weight(FontWeight::SEMIBOLD),
-                            )
-                    })
-                    .child(self.render_field("Name", &form.name_editor, cx))
-                    .when(is_sqlite, |d| {
-                        d.child(self.render_sqlite_path_field(cx))
-                    })
-                    .when(!is_sqlite, |d| {
-                        d.child(
-                            div().flex().gap_2().w_full()
-                                .child(div().flex_1().child(self.render_field("Host", &form.host_editor, cx)))
-                                .child(div().w(px(70.)).child(self.render_field("Port", &form.port_editor, cx))),
-                        )
-                        .child(self.render_field("Database", &form.database_editor, cx))
-                        .child(self.render_field("User", &form.user_editor, cx))
-                        .child(self.render_field("Password", &form.password_editor, cx))
-                    })
-                    // Error / test status messages
-                    .when_some(form.error_message.clone(), |d, msg| {
-                        d.child(Label::new(msg).size(LabelSize::XSmall).color(Color::Error))
-                    })
-                    .when_some(form.test_status.clone(), |d, status| {
-                        d.child(match status {
-                            TestStatus::Testing => div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(Icon::new(IconName::ArrowCircle).size(IconSize::XSmall).color(Color::Warning))
-                                .child(Label::new("Testing connection...").size(LabelSize::XSmall).color(Color::Warning))
-                                .into_any_element(),
-                            TestStatus::Success => div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Success))
-                                .child(Label::new("Connection successful!").size(LabelSize::XSmall).color(Color::Success))
-                                .into_any_element(),
-                            TestStatus::Failed(msg) => div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(Icon::new(IconName::Close).size(IconSize::XSmall).color(Color::Error))
-                                .child(Label::new(msg).size(LabelSize::XSmall).color(Color::Error))
-                                .into_any_element(),
-                        })
-                    })
-                    // Test connection button
-                    .child(
-                        Button::new("test_conn", "Test Connection")
-                            .full_width()
-                            .style(ButtonStyle::Subtle)
-                            .disabled(matches!(form.test_status, Some(TestStatus::Testing)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.test_form_connection(window, cx);
-                            })),
-                    )
-                    // Save / Cancel buttons
-                    .child(
-                        div().flex().gap_2().pt_1().w_full()
-                            .child(div().flex_1().child(
-                                Button::new("cancel", "Cancel")
-                                    .full_width()
-                                    .style(ButtonStyle::Subtle)
-                                    .on_click(cx.listener(|this, _, _w, cx| this.cancel_form(cx))),
-                            ))
-                            .child(div().flex_1().child(
-                                Button::new("save", "Save")
-                                    .full_width()
-                                    .style(ButtonStyle::Filled)
-                                    .on_click(cx.listener(|this, _, _w, cx| this.save_form(cx))),
-                            )),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_sqlite_path_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(ref form) = self.conn_form else {
-            return div().into_any_element();
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_px()
-            .w_full()
-            .child(Label::new("Database File").size(LabelSize::XSmall).color(Color::Muted))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .w_full()
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(cx.theme().colors().border)
-                            .bg(cx.theme().colors().editor_background)
-                            .child(form.database_editor.clone()),
-                    )
-                    .child(
-                        Button::new("browse_db", "Browse")
-                            .style(ButtonStyle::Subtle)
-                            .label_size(LabelSize::XSmall)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.browse_sqlite_file(window, cx);
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn browse_sqlite_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: None,
-        });
-
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await {
-                if let Some(path) = paths.first() {
-                    let path_str = path.to_string_lossy().to_string();
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        if let Some(ref form) = this.conn_form {
-                            form.database_editor.update(cx, |editor, cx| {
-                                editor.set_text(path_str, window, cx);
-                            });
-                        }
-                    });
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn render_field(
-        &self,
-        label: &'static str,
-        editor: &Entity<Editor>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_px()
-            .w_full()
-            .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
-            .child(
-                div()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .bg(cx.theme().colors().editor_background)
-                    .child(editor.clone()),
-            )
     }
 }
 
@@ -2550,7 +871,7 @@ impl Panel for DatabasePanel {
     fn panel_key() -> &'static str { "database_panel" }
 
     fn position(&self, _w: &Window, _cx: &App) -> DockPosition {
-        DatabasePanelSettings::dock()
+        DatabasePanelSettings::global().dock
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
@@ -2560,7 +881,7 @@ impl Panel for DatabasePanel {
     fn set_position(&mut self, _p: DockPosition, _w: &mut Window, _cx: &mut Context<Self>) {}
 
     fn default_size(&self, _w: &Window, _cx: &App) -> Pixels {
-        DatabasePanelSettings::default_width()
+        DatabasePanelSettings::global().default_width
     }
 
     fn icon(&self, _w: &Window, _cx: &App) -> Option<ui::IconName> {

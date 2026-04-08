@@ -18,5 +18,10 @@ tokio.workspace = true
 toml.workspace = true
 uuid.workspace = true
 
+url.workspace = true
+
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "sqlite", "chrono", "uuid", "json"] }
 sqlparser = { version = "0.61", features = ["visitor"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

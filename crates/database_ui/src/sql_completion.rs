@@ -24,7 +24,7 @@ impl SqlCompletionProvider {
         }
     }
 
-    fn build_completions(
+    pub(crate) fn build_completions(
         &self,
         prefix: &str,
         buffer_text: &str,
@@ -59,46 +59,142 @@ impl SqlCompletionProvider {
         // Parse aliases to resolve alias.column completions
         let aliases = parse_aliases(buffer_text);
 
+        // Collect all distinct schema names for schema-qualified completions
+        let all_schema_names: Vec<String> = schema
+            .tables
+            .iter()
+            .map(|t| t.schema.clone())
+            .chain(schema.views.iter().map(|v| v.schema.clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        // All tables/views unfiltered (for schema-qualified lookups)
+        let all_tables = &schema.tables;
+        let all_views = &schema.views;
+
         match context {
             SqlContext::AfterDot(ref name) => {
-                // Resolve alias → table name, or use directly as table name
-                let resolved = aliases
-                    .get(&name.to_lowercase())
-                    .cloned()
-                    .unwrap_or_else(|| name.to_lowercase());
+                let name_lower = name.to_lowercase();
 
-                // Column completions for the resolved table (or view)
-                let target_table = tables
+                // Check if name is a schema name → suggest tables/views in that schema
+                let is_schema = all_schema_names
                     .iter()
-                    .find(|t| t.name.to_lowercase() == resolved);
-                let target_view = views
-                    .iter()
-                    .find(|v| v.name.to_lowercase() == resolved);
+                    .any(|s| s.to_lowercase() == name_lower);
 
-                let columns = target_table
-                    .map(|t| t.columns.as_slice())
-                    .or_else(|| target_view.map(|v| v.columns.as_slice()));
-
-                if let Some(cols) = columns {
-                    for col in cols {
-                        if prefix.is_empty() || col.name.to_lowercase().starts_with(&prefix_lower)
+                if is_schema {
+                    for table in all_tables {
+                        if table.schema.to_lowercase() == name_lower
+                            && (prefix.is_empty()
+                                || table.name.to_lowercase().starts_with(&prefix_lower))
+                        {
+                            let cols: Vec<_> =
+                                table.columns.iter().map(|c| c.name.as_str()).collect();
+                            completions.push(make_completion(
+                                replace_range.clone(),
+                                &table.name,
+                                &format!("{} ({})", table.name, cols.join(", ")),
+                                "table",
+                            ));
+                        }
+                    }
+                    for view in all_views {
+                        if view.schema.to_lowercase() == name_lower
+                            && (prefix.is_empty()
+                                || view.name.to_lowercase().starts_with(&prefix_lower))
                         {
                             completions.push(make_completion(
                                 replace_range.clone(),
-                                &col.name,
-                                &format!("{} ({})", col.name, col.data_type),
-                                &col.data_type,
+                                &view.name,
+                                &format!("{} (view)", view.name),
+                                "view",
                             ));
+                        }
+                    }
+                } else {
+                    // Resolve alias → table name, or use directly as table name
+                    let resolved = aliases
+                        .get(&name_lower)
+                        .cloned()
+                        .unwrap_or(name_lower);
+
+                    // Handle schema-qualified names (e.g., "audit.action_plan_aud")
+                    let (resolved_schema, resolved_table) =
+                        if let Some((schema_part, table_part)) = resolved.rsplit_once('.') {
+                            (Some(schema_part.to_string()), table_part.to_string())
+                        } else {
+                            (None, resolved.clone())
+                        };
+
+                    // Search in all tables when schema-qualified, otherwise in filtered tables
+                    let search_tables: Vec<&database_core::Table> = if resolved_schema.is_some() {
+                        all_tables.iter().collect()
+                    } else {
+                        tables.clone()
+                    };
+                    let search_views: Vec<&database_core::View> = if resolved_schema.is_some() {
+                        all_views.iter().collect()
+                    } else {
+                        views.clone()
+                    };
+
+                    let target_table = search_tables.iter().find(|t| {
+                        t.name.to_lowercase() == resolved_table
+                            && resolved_schema
+                                .as_ref()
+                                .map_or(true, |s| t.schema.to_lowercase() == *s)
+                    });
+                    let target_view = search_views.iter().find(|v| {
+                        v.name.to_lowercase() == resolved_table
+                            && resolved_schema
+                                .as_ref()
+                                .map_or(true, |s| v.schema.to_lowercase() == *s)
+                    });
+
+                    let columns = target_table
+                        .map(|t| t.columns.as_slice())
+                        .or_else(|| target_view.map(|v| v.columns.as_slice()));
+
+                    if let Some(cols) = columns {
+                        for col in cols {
+                            if prefix.is_empty()
+                                || col.name.to_lowercase().starts_with(&prefix_lower)
+                            {
+                                completions.push(make_completion(
+                                    replace_range.clone(),
+                                    &col.name,
+                                    &format!("{} ({})", col.name, col.data_type),
+                                    &col.data_type,
+                                ));
+                            }
                         }
                     }
                 }
             }
-            SqlContext::AfterFrom | SqlContext::AfterJoin | SqlContext::AfterUpdate | SqlContext::AfterInto => {
+            SqlContext::AfterFrom
+            | SqlContext::AfterJoin
+            | SqlContext::AfterUpdate
+            | SqlContext::AfterInto => {
+                // Schema name completions (e.g., type "pub" → "public.")
+                for schema_name in &all_schema_names {
+                    if prefix.is_empty()
+                        || schema_name.to_lowercase().starts_with(&prefix_lower)
+                    {
+                        completions.push(make_completion(
+                            replace_range.clone(),
+                            schema_name,
+                            &format!("{schema_name} (schema)"),
+                            "schema",
+                        ));
+                    }
+                }
                 // Table name completions
                 for table in &tables {
                     if prefix.is_empty() || table.name.to_lowercase().starts_with(&prefix_lower) {
-                        let cols: Vec<_> = table.columns.iter().map(|c| c.name.as_str()).collect();
-                        completions.push(make_completion(replace_range.clone(),
+                        let cols: Vec<_> =
+                            table.columns.iter().map(|c| c.name.as_str()).collect();
+                        completions.push(make_completion(
+                            replace_range.clone(),
                             &table.name,
                             &format!("{} ({})", table.name, cols.join(", ")),
                             "table",
@@ -107,7 +203,8 @@ impl SqlCompletionProvider {
                 }
                 for view in &views {
                     if prefix.is_empty() || view.name.to_lowercase().starts_with(&prefix_lower) {
-                        completions.push(make_completion(replace_range.clone(),
+                        completions.push(make_completion(
+                            replace_range.clone(),
                             &view.name,
                             &format!("{} (view)", view.name),
                             "view",
@@ -116,16 +213,34 @@ impl SqlCompletionProvider {
                 }
             }
             SqlContext::General => {
-                // Keywords + table names + functions
-                completions.extend(self.keyword_completions(&prefix_lower, replace_range.clone()));
+                // Keywords + table names + schema names + functions
+                completions
+                    .extend(self.keyword_completions(&prefix_lower, replace_range.clone()));
 
-                for table in &tables {
-                    if table.name.to_lowercase().starts_with(&prefix_lower) {
-                        completions.push(make_completion(replace_range.clone(), &table.name, &table.name, "table"));
+                for schema_name in &all_schema_names {
+                    if schema_name.to_lowercase().starts_with(&prefix_lower) {
+                        completions.push(make_completion(
+                            replace_range.clone(),
+                            schema_name,
+                            &format!("{schema_name} (schema)"),
+                            "schema",
+                        ));
                     }
                 }
 
-                completions.extend(self.function_completions(&prefix_lower, replace_range.clone()));
+                for table in &tables {
+                    if table.name.to_lowercase().starts_with(&prefix_lower) {
+                        completions.push(make_completion(
+                            replace_range.clone(),
+                            &table.name,
+                            &table.name,
+                            "table",
+                        ));
+                    }
+                }
+
+                completions
+                    .extend(self.function_completions(&prefix_lower, replace_range.clone()));
             }
         }
 

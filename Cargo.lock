@@ -4550,6 +4550,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toml 0.8.23",
+ "url",
  "uuid",
 ]
 

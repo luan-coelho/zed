@@ -6,65 +6,77 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Column as _, PgPool, Row};
 use tokio::sync::RwLock;
 
-use crate::provider::DatabaseProvider;
+use super::PoolManager;
+use crate::provider::{
+    is_read_query, DatabaseProvider, FormPlaceholders, ProviderCapabilities, ProviderMetadata,
+};
 use crate::schema::*;
 
 pub struct PostgresProvider {
-    pool: RwLock<Option<(String, PgPool)>>,
+    pools: PoolManager<PgPool>,
+    pinned_conn: RwLock<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
 }
 
 impl PostgresProvider {
     pub fn new() -> Self {
         Self {
-            pool: RwLock::new(None),
+            pools: PoolManager::new(),
+            pinned_conn: RwLock::new(None),
         }
     }
 
     async fn ensure_pool(&self, url: &str) -> Result<PgPool> {
-        {
-            let guard = self.pool.read().await;
-            if let Some((cached_url, pool)) = guard.as_ref() {
-                if cached_url == url && !pool.is_closed() {
-                    return Ok(pool.clone());
-                }
-            }
-        }
-
-        // Log connection attempt (mask password)
-        let masked_url = url
-            .find("://")
-            .and_then(|start| {
-                let after = &url[start + 3..];
-                after.find('@').map(|at| {
-                    let user_end = after.find(':').unwrap_or(at);
-                    format!(
-                        "{}://{}:***@{}",
-                        &url[..start],
-                        &after[..user_end],
-                        &after[at + 1..]
-                    )
-                })
+        self.pools
+            .get_or_create(url, |url| async move {
+                PgPoolOptions::new()
+                    .max_connections(5)
+                    .acquire_timeout(std::time::Duration::from_secs(10))
+                    .connect(&url)
+                    .await
+                    .context("failed to connect to PostgreSQL")
             })
-            .unwrap_or_else(|| url.to_string());
-        eprintln!("[database_core] Connecting to: {masked_url}");
-
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(std::time::Duration::from_secs(10))
-            .connect(url)
             .await
-            .context("failed to connect to PostgreSQL")?;
+    }
+}
 
-        let mut guard = self.pool.write().await;
-        *guard = Some((url.to_string(), pool.clone()));
-        Ok(pool)
+impl ProviderMetadata for PostgresProvider {
+    fn id(&self) -> &'static str { "postgres" }
+    fn display_name(&self) -> &'static str { "PostgreSQL" }
+    fn default_port(&self) -> u16 { 5432 }
+    fn default_user(&self) -> &'static str { "postgres" }
+    fn url_scheme(&self) -> &'static str { "postgres" }
+    fn aliases(&self) -> &'static [&'static str] { &["postgresql"] }
+    fn is_file_based(&self) -> bool { false }
+    fn form_placeholders(&self) -> FormPlaceholders {
+        FormPlaceholders {
+            name: "my_connection",
+            host: "localhost",
+            port: "5432",
+            database: "mydb",
+            database_label: "Database",
+            user: "postgres",
+            password: "stored in OS keychain",
+        }
     }
 }
 
 #[async_trait]
 impl DatabaseProvider for PostgresProvider {
-    fn name(&self) -> &str {
-        "postgres"
+    fn metadata(&self) -> &dyn ProviderMetadata {
+        self
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            multi_database: true,
+            schemas: true,
+            roles: true,
+            users: false,
+            create_database: true,
+            create_schema: true,
+            create_role: true,
+            requires_reconnect_for_database_switch: true,
+        }
     }
 
     async fn test_connection(&self, url: &str) -> Result<()> {
@@ -77,14 +89,7 @@ impl DatabaseProvider for PostgresProvider {
         let pool = self.ensure_pool(url).await?;
         let start = Instant::now();
 
-        let trimmed = sql.trim_start().to_uppercase();
-        let is_query = trimmed.starts_with("SELECT")
-            || trimmed.starts_with("WITH")
-            || trimmed.starts_with("EXPLAIN")
-            || trimmed.starts_with("SHOW")
-            || trimmed.starts_with("TABLE");
-
-        if is_query {
+        if is_read_query(sql) {
             let rows = sqlx::query(sql).fetch_all(&pool).await?;
             let elapsed = start.elapsed().as_millis() as u64;
 
@@ -241,14 +246,7 @@ impl DatabaseProvider for PostgresProvider {
             .context("failed to set search_path")?;
 
         let start = Instant::now();
-        let trimmed = sql.trim_start().to_uppercase();
-        let is_query = trimmed.starts_with("SELECT")
-            || trimmed.starts_with("WITH")
-            || trimmed.starts_with("EXPLAIN")
-            || trimmed.starts_with("SHOW")
-            || trimmed.starts_with("TABLE");
-
-        if is_query {
+        if is_read_query(sql) {
             let rows = sqlx::query(sql).fetch_all(&mut *conn).await?;
             let elapsed = start.elapsed().as_millis() as u64;
 
@@ -316,6 +314,177 @@ impl DatabaseProvider for PostgresProvider {
         }
 
         Ok(plan)
+    }
+
+    async fn list_databases(&self, url: &str) -> Result<Vec<DatabaseEntry>> {
+        let pool = self.ensure_pool(url).await?;
+        let current_db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await?;
+
+        let rows = sqlx::query(
+            "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname",
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let name: String = row.get("datname");
+                DatabaseEntry {
+                    is_current: name == current_db,
+                    name,
+                }
+            })
+            .collect())
+    }
+
+    async fn list_schemas(&self, url: &str) -> Result<Vec<SchemaEntry>> {
+        let pool = self.ensure_pool(url).await?;
+        let rows = sqlx::query(
+            "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let name: String = row.get("schema_name");
+                SchemaEntry {
+                    is_system: matches!(
+                        name.as_str(),
+                        "pg_catalog" | "information_schema" | "pg_toast"
+                    ),
+                    name,
+                }
+            })
+            .collect())
+    }
+
+    async fn list_roles(&self, url: &str) -> Result<Vec<RoleEntry>> {
+        let pool = self.ensure_pool(url).await?;
+        let rows = sqlx::query(
+            "SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin \
+             FROM pg_roles WHERE rolname NOT LIKE 'pg_%' ORDER BY rolname",
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| RoleEntry {
+                name: row.get("rolname"),
+                is_superuser: row.get("rolsuper"),
+                can_login: row.get("rolcanlogin"),
+                can_create_db: row.get("rolcreatedb"),
+                can_create_role: row.get("rolcreaterole"),
+            })
+            .collect())
+    }
+
+    async fn get_schema_for_database(
+        &self,
+        base_url: &str,
+        database: &str,
+    ) -> Result<DatabaseSchema> {
+        let url = crate::config::replace_database_in_url(base_url, database)?;
+        self.get_schema(&url).await
+    }
+
+    async fn create_database(&self, url: &str, name: &str) -> Result<()> {
+        let pool = self.ensure_pool(url).await?;
+        let sql = format!("CREATE DATABASE \"{}\"", name.replace('"', "\"\""));
+        sqlx::query(&sql).execute(&pool).await?;
+        Ok(())
+    }
+
+    async fn create_schema(&self, url: &str, name: &str) -> Result<()> {
+        let pool = self.ensure_pool(url).await?;
+        let sql = format!("CREATE SCHEMA \"{}\"", name.replace('"', "\"\""));
+        sqlx::query(&sql).execute(&pool).await?;
+        Ok(())
+    }
+
+    async fn create_role(&self, url: &str, name: &str) -> Result<()> {
+        let pool = self.ensure_pool(url).await?;
+        let sql = format!("CREATE ROLE \"{}\"", name.replace('"', "\"\""));
+        sqlx::query(&sql).execute(&pool).await?;
+        Ok(())
+    }
+
+    async fn begin_transaction(&self, url: &str, isolation: Option<&str>) -> Result<()> {
+        let pool = self.ensure_pool(url).await?;
+        let mut conn = pool.acquire().await.context("failed to acquire connection for transaction")?;
+
+        if let Some(level) = isolation {
+            let set_isolation = format!("SET TRANSACTION ISOLATION LEVEL {level}");
+            sqlx::query(&set_isolation).execute(&mut *conn).await?;
+        }
+        sqlx::query("BEGIN").execute(&mut *conn).await?;
+
+        let mut guard = self.pinned_conn.write().await;
+        *guard = Some(conn);
+        Ok(())
+    }
+
+    async fn commit_transaction(&self, _url: &str) -> Result<()> {
+        let mut guard = self.pinned_conn.write().await;
+        let mut conn = guard.take().ok_or_else(|| anyhow::anyhow!("No active transaction"))?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(())
+    }
+
+    async fn rollback_transaction(&self, _url: &str) -> Result<()> {
+        let mut guard = self.pinned_conn.write().await;
+        let mut conn = guard.take().ok_or_else(|| anyhow::anyhow!("No active transaction"))?;
+        sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+        Ok(())
+    }
+
+    async fn execute_in_transaction(&self, _url: &str, sql: &str) -> Result<QueryResult> {
+        let mut guard = self.pinned_conn.write().await;
+        let conn = guard.as_mut().ok_or_else(|| anyhow::anyhow!("No active transaction"))?;
+
+        let start = Instant::now();
+
+        if is_read_query(sql) {
+            let rows = sqlx::query(sql).fetch_all(&mut **conn).await?;
+            let elapsed = start.elapsed().as_millis() as u64;
+
+            let mut result = QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: rows.len() as u64,
+                execution_time_ms: elapsed,
+            };
+
+            if let Some(first_row) = rows.first() {
+                result.columns = first_row.columns().iter().map(|c| c.name().to_string()).collect();
+            }
+            for row in &rows {
+                let mut row_values = Vec::new();
+                for i in 0..row.columns().len() {
+                    row_values.push(get_column_value_as_string(row, i));
+                }
+                result.rows.push(row_values);
+            }
+            Ok(result)
+        } else {
+            let pg_result = sqlx::query(sql).execute(&mut **conn).await?;
+            let elapsed = start.elapsed().as_millis() as u64;
+            Ok(QueryResult {
+                columns: vec!["rows_affected".to_string()],
+                rows: vec![vec![pg_result.rows_affected().to_string()]],
+                rows_affected: pg_result.rows_affected(),
+                execution_time_ms: elapsed,
+            })
+        }
+    }
+
+    async fn has_active_transaction(&self, _url: &str) -> bool {
+        self.pinned_conn.read().await.is_some()
     }
 }
 

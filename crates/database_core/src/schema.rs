@@ -70,3 +70,24 @@ pub struct QueryResult {
     pub rows_affected: u64,
     pub execution_time_ms: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseEntry {
+    pub name: String,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaEntry {
+    pub name: String,
+    pub is_system: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleEntry {
+    pub name: String,
+    pub is_superuser: bool,
+    pub can_login: bool,
+    pub can_create_db: bool,
+    pub can_create_role: bool,
+}
