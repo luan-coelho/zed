@@ -20,6 +20,48 @@ fn escape_csv(value: &str) -> String {
     }
 }
 
+pub(crate) fn format_as_tsv(columns: &[String], rows: &[Vec<String>]) -> String {
+    let mut output = columns.join("\t");
+    output.push('\n');
+    for row in rows {
+        output.push_str(&row.join("\t"));
+        output.push('\n');
+    }
+    output
+}
+
+pub(crate) fn format_as_csv(columns: &[String], rows: &[Vec<String>]) -> String {
+    let mut output = columns.iter().map(|c| escape_csv(c)).collect::<Vec<_>>().join(",");
+    output.push('\n');
+    for row in rows {
+        output.push_str(&row.iter().map(|v| escape_csv(v)).collect::<Vec<_>>().join(","));
+        output.push('\n');
+    }
+    output
+}
+
+pub(crate) fn format_as_json(columns: &[String], rows: &[Vec<String>]) -> Option<String> {
+    let json_rows: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let mut obj = serde_json::Map::new();
+            for (i, col) in columns.iter().enumerate() {
+                let val = row.get(i).cloned().unwrap_or_default();
+                obj.insert(
+                    col.clone(),
+                    if val == "NULL" {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(val)
+                    },
+                );
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    serde_json::to_string_pretty(&json_rows).ok()
+}
+
 actions!(database_result_panel, [ToggleFocus,]);
 
 
@@ -183,73 +225,62 @@ impl DatabaseResultPanel {
     }
 
     fn copy_active_result_as_tsv(&self, cx: &mut Context<Self>) {
-        let Some(result) = self.active_result_data() else {
-            return;
-        };
-        let mut output = result.columns.join("\t");
-        output.push('\n');
-        for row in &result.rows {
-            output.push_str(&row.join("\t"));
-            output.push('\n');
-        }
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(output));
+        let Some(result) = self.active_result_data() else { return };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            format_as_tsv(&result.columns, &result.rows),
+        ));
+    }
+
+    fn build_csv(&self) -> Option<String> {
+        let result = self.active_result_data()?;
+        Some(format_as_csv(&result.columns, &result.rows))
+    }
+
+    fn build_json(&self) -> Option<String> {
+        let result = self.active_result_data()?;
+        format_as_json(&result.columns, &result.rows)
     }
 
     fn copy_active_result_as_csv(&self, cx: &mut Context<Self>) {
-        let Some(result) = self.active_result_data() else {
-            return;
-        };
-        let mut output = String::new();
-        // Header
-        output.push_str(
-            &result
-                .columns
-                .iter()
-                .map(|c| escape_csv(c))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        output.push('\n');
-        // Rows
-        for row in &result.rows {
-            output.push_str(
-                &row.iter()
-                    .map(|v| escape_csv(v))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            output.push('\n');
+        if let Some(csv) = self.build_csv() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(csv));
         }
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(output));
     }
 
     fn copy_active_result_as_json(&self, cx: &mut Context<Self>) {
-        let Some(result) = self.active_result_data() else {
-            return;
-        };
-        let rows: Vec<serde_json::Value> = result
-            .rows
-            .iter()
-            .map(|row| {
-                let mut obj = serde_json::Map::new();
-                for (i, col) in result.columns.iter().enumerate() {
-                    let val = row.get(i).cloned().unwrap_or_default();
-                    obj.insert(
-                        col.clone(),
-                        if val == "NULL" {
-                            serde_json::Value::Null
-                        } else {
-                            serde_json::Value::String(val)
-                        },
-                    );
-                }
-                serde_json::Value::Object(obj)
-            })
-            .collect();
-
-        if let Ok(json) = serde_json::to_string_pretty(&rows) {
+        if let Some(json) = self.build_json() {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(json));
         }
+    }
+
+    fn export_as_csv(&self, cx: &mut Context<Self>) {
+        let Some(csv) = self.build_csv() else { return };
+        let receiver = cx.prompt_for_new_path(
+            &std::path::PathBuf::from("."),
+            Some("export.csv"),
+        );
+        cx.background_executor()
+            .spawn(async move {
+                if let Ok(Ok(Some(path))) = receiver.await {
+                    let _ = std::fs::write(&path, csv);
+                }
+            })
+            .detach();
+    }
+
+    fn export_as_json(&self, cx: &mut Context<Self>) {
+        let Some(json) = self.build_json() else { return };
+        let receiver = cx.prompt_for_new_path(
+            &std::path::PathBuf::from("."),
+            Some("export.json"),
+        );
+        cx.background_executor()
+            .spawn(async move {
+                if let Ok(Ok(Some(path))) = receiver.await {
+                    let _ = std::fs::write(&path, json);
+                }
+            })
+            .detach();
     }
 
     fn deploy_tab_context_menu(
@@ -1114,24 +1145,45 @@ impl DatabaseResultPanel {
                                 Button::new("copy-all", "Copy")
                                     .style(ButtonStyle::Subtle)
                                     .label_size(LabelSize::XSmall)
+                                    .tooltip(|_w, cx| Tooltip::simple("Copy as TSV to clipboard", cx))
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.copy_active_result_as_tsv(cx);
                                     })),
                             )
                             .child(
-                                Button::new("export-csv", "CSV")
+                                Button::new("copy-csv", "Copy CSV")
                                     .style(ButtonStyle::Subtle)
                                     .label_size(LabelSize::XSmall)
+                                    .tooltip(|_w, cx| Tooltip::simple("Copy as CSV to clipboard", cx))
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.copy_active_result_as_csv(cx);
                                     })),
                             )
                             .child(
-                                Button::new("export-json", "JSON")
+                                Button::new("copy-json", "Copy JSON")
                                     .style(ButtonStyle::Subtle)
                                     .label_size(LabelSize::XSmall)
+                                    .tooltip(|_w, cx| Tooltip::simple("Copy as JSON to clipboard", cx))
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.copy_active_result_as_json(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("export-csv", "Export CSV")
+                                    .style(ButtonStyle::Subtle)
+                                    .label_size(LabelSize::XSmall)
+                                    .tooltip(|_w, cx| Tooltip::simple("Save as CSV file", cx))
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.export_as_csv(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("export-json", "Export JSON")
+                                    .style(ButtonStyle::Subtle)
+                                    .label_size(LabelSize::XSmall)
+                                    .tooltip(|_w, cx| Tooltip::simple("Save as JSON file", cx))
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.export_as_json(cx);
                                     })),
                             ),
                     ),

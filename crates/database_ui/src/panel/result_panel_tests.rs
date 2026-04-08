@@ -201,3 +201,145 @@ fn test_sort_then_filter() {
     assert_eq!(filtered.len(), 2);
     assert!(filtered.iter().all(|r| r[1] == "Alice"));
 }
+
+// ── Export format tests ────────────────────────────────────────────
+
+use crate::result_panel::{format_as_csv, format_as_json, format_as_tsv};
+
+fn sample_columns() -> Vec<String> {
+    vec!["id".into(), "name".into(), "email".into()]
+}
+
+fn sample_export_rows() -> Vec<Vec<String>> {
+    vec![
+        vec!["1".into(), "Alice".into(), "alice@example.com".into()],
+        vec!["2".into(), "Bob".into(), "bob@example.com".into()],
+    ]
+}
+
+// ── TSV ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_tsv_header() {
+    let tsv = format_as_tsv(&sample_columns(), &sample_export_rows());
+    let first_line = tsv.lines().next().expect("should have header");
+    assert_eq!(first_line, "id\tname\temail");
+}
+
+#[test]
+fn test_tsv_rows() {
+    let tsv = format_as_tsv(&sample_columns(), &sample_export_rows());
+    let lines: Vec<&str> = tsv.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[1], "1\tAlice\talice@example.com");
+    assert_eq!(lines[2], "2\tBob\tbob@example.com");
+}
+
+#[test]
+fn test_tsv_empty_rows() {
+    let tsv = format_as_tsv(&sample_columns(), &[]);
+    let lines: Vec<&str> = tsv.lines().collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0], "id\tname\temail");
+}
+
+// ── CSV ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_csv_header() {
+    let csv = format_as_csv(&sample_columns(), &sample_export_rows());
+    let first_line = csv.lines().next().expect("should have header");
+    assert_eq!(first_line, "id,name,email");
+}
+
+#[test]
+fn test_csv_rows() {
+    let csv = format_as_csv(&sample_columns(), &sample_export_rows());
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[1], "1,Alice,alice@example.com");
+}
+
+#[test]
+fn test_csv_escapes_commas() {
+    let cols = vec!["name".into()];
+    let rows = vec![vec!["hello, world".into()]];
+    let csv = format_as_csv(&cols, &rows);
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines[1], "\"hello, world\"");
+}
+
+#[test]
+fn test_csv_escapes_quotes() {
+    let cols = vec!["name".into()];
+    let rows = vec![vec!["say \"hi\"".into()]];
+    let csv = format_as_csv(&cols, &rows);
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines[1], "\"say \"\"hi\"\"\"");
+}
+
+#[test]
+fn test_csv_escapes_newlines() {
+    let cols = vec!["bio".into()];
+    let rows = vec![vec!["line1\nline2".into()]];
+    let csv = format_as_csv(&cols, &rows);
+    assert!(csv.contains("\"line1\nline2\""));
+}
+
+#[test]
+fn test_csv_empty_rows() {
+    let csv = format_as_csv(&sample_columns(), &[]);
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines.len(), 1);
+}
+
+// ── JSON ───────────────────────────────────────────────────────────
+
+#[test]
+fn test_json_structure() {
+    let json = format_as_json(&sample_columns(), &sample_export_rows()).expect("should produce JSON");
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("should parse");
+    assert_eq!(parsed.len(), 2);
+}
+
+#[test]
+fn test_json_keys_match_columns() {
+    let json = format_as_json(&sample_columns(), &sample_export_rows()).expect("should produce JSON");
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("should parse");
+    let obj = parsed[0].as_object().expect("should be object");
+    assert!(obj.contains_key("id"));
+    assert!(obj.contains_key("name"));
+    assert!(obj.contains_key("email"));
+}
+
+#[test]
+fn test_json_values() {
+    let json = format_as_json(&sample_columns(), &sample_export_rows()).expect("should produce JSON");
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("should parse");
+    assert_eq!(parsed[0]["id"], "1");
+    assert_eq!(parsed[0]["name"], "Alice");
+    assert_eq!(parsed[1]["name"], "Bob");
+}
+
+#[test]
+fn test_json_null_values() {
+    let cols = vec!["id".into(), "val".into()];
+    let rows = vec![vec!["1".into(), "NULL".into()]];
+    let json = format_as_json(&cols, &rows).expect("should produce JSON");
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("should parse");
+    assert!(parsed[0]["val"].is_null());
+}
+
+#[test]
+fn test_json_empty_rows() {
+    let json = format_as_json(&sample_columns(), &[]).expect("should produce JSON");
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("should parse");
+    assert!(parsed.is_empty());
+}
+
+#[test]
+fn test_json_is_pretty_printed() {
+    let json = format_as_json(&sample_columns(), &sample_export_rows()).expect("should produce JSON");
+    assert!(json.contains('\n'));
+    assert!(json.contains("  "));
+}

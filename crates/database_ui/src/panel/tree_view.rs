@@ -52,7 +52,7 @@ impl DatabasePanel {
                     )
                     .child(
                         Label::new(title_label)
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Default)
                             .weight(FontWeight::SEMIBOLD)
                             .color(title_color),
                     ),
@@ -144,7 +144,7 @@ impl DatabasePanel {
             tree = tree.child(
                 div().px_3().py_1().child(
                     Label::new("Global Data Sources")
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .weight(FontWeight::SEMIBOLD)
                         .color(Color::Muted),
                 ),
@@ -159,7 +159,7 @@ impl DatabasePanel {
             tree = tree.child(
                 div().px_3().py_1().mt_1().child(
                     Label::new("Project Data Sources")
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .weight(FontWeight::SEMIBOLD)
                         .color(Color::Muted),
                 ),
@@ -252,7 +252,7 @@ impl DatabasePanel {
                 .child(Icon::new(status_icon).size(IconSize::XSmall).color(status_color))
                 .child(
                     Label::new(display)
-                        .size(LabelSize::Small)
+                        .size(LabelSize::Default)
                         .weight(if is_active_query { FontWeight::BOLD } else { FontWeight::NORMAL }),
                 )
                 // Action buttons on hover/selection
@@ -299,7 +299,7 @@ impl DatabasePanel {
             node = node.child(
                 div().pl(px(28.)).pr_2().child(
                     Label::new(msg.clone())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .color(Color::Error),
                 ),
             );
@@ -326,7 +326,7 @@ impl DatabasePanel {
             node = node.child(
                 div().pl(px(28.)).child(
                     Label::new("Connecting...")
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .color(Color::Warning),
                 ),
             );
@@ -412,7 +412,7 @@ impl DatabasePanel {
                 .child(
                     div().pl(px(28.)).child(
                         Label::new("Loading databases...")
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Default)
                             .color(Color::Muted),
                     ),
                 )
@@ -493,7 +493,7 @@ impl DatabasePanel {
                 .child(Icon::new(IconName::DatabaseZap).size(IconSize::XSmall).color(icon_color))
                 .child(
                     Label::new(db.name.clone())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .weight(if db.is_current {
                             FontWeight::BOLD
                         } else {
@@ -510,7 +510,7 @@ impl DatabasePanel {
                 node = node.child(
                     div().pl(px(40.)).child(
                         Label::new("Loading schemas...")
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Default)
                             .color(Color::Muted),
                     ),
                 );
@@ -599,7 +599,7 @@ impl DatabasePanel {
                         .color(Color::Muted),
                     )
                     .child(Icon::new(IconName::Folder).size(IconSize::XSmall).color(Color::Muted))
-                    .child(Label::new(schema_name.clone()).size(LabelSize::XSmall)),
+                    .child(Label::new(schema_name.clone()).size(LabelSize::Default)),
             );
 
             if is_expanded {
@@ -824,11 +824,11 @@ impl DatabasePanel {
                 }
             }))
             .child(Icon::new(IconName::Person).size(IconSize::XSmall).color(Color::Muted))
-            .child(Label::new(role.name.clone()).size(LabelSize::XSmall))
+            .child(Label::new(role.name.clone()).size(LabelSize::Default))
             .when(!badges.is_empty(), |d| {
                 d.child(
                     Label::new(badges.join(", "))
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .color(Color::Muted),
                 )
             })
@@ -868,7 +868,7 @@ impl DatabasePanel {
                     .color(Color::Muted),
             )
             .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Accent))
-            .child(Label::new(label.to_string()).size(LabelSize::XSmall))
+            .child(Label::new(label.to_string()).size(LabelSize::Default))
     }
 
     pub(crate) fn render_table_node(
@@ -917,7 +917,7 @@ impl DatabasePanel {
                         .color(Color::Muted),
                 )
                 .child(Icon::new(IconName::FileTextOutlined).size(IconSize::XSmall).color(Color::Accent))
-                .child(Label::new(table.name.clone()).size(LabelSize::XSmall))
+                .child(Label::new(table.name.clone()).size(LabelSize::Default))
                 .child(div().flex_1())
                 .child({
                     let schema = table.schema.clone();
@@ -977,7 +977,7 @@ impl DatabasePanel {
                         .color(Color::Muted),
                 )
                 .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(Color::Warning))
-                .child(Label::new(view.name.clone()).size(LabelSize::XSmall)),
+                .child(Label::new(view.name.clone()).size(LabelSize::Default)),
         );
 
         if is_expanded {
@@ -1056,7 +1056,7 @@ impl DatabasePanel {
                         .size(IconSize::XSmall)
                         .color(Color::Accent),
                 )
-                .child(Label::new(table.name.clone()).size(LabelSize::XSmall))
+                .child(Label::new(table.name.clone()).size(LabelSize::Default))
                 .child(div().flex_1())
                 .child({
                     let schema = table.schema.clone();
@@ -1134,7 +1134,7 @@ impl DatabasePanel {
                     .color(Color::Muted),
                 )
                 .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(Color::Warning))
-                .child(Label::new(view.name.clone()).size(LabelSize::XSmall)),
+                .child(Label::new(view.name.clone()).size(LabelSize::Default)),
         );
 
         if is_expanded {
@@ -1262,10 +1262,10 @@ impl DatabasePanel {
             .pr_2()
             .py_px()
             .child(Icon::new(IconName::Dash).size(IconSize::XSmall).color(Color::Muted))
-            .child(Label::new(label.to_string()).size(LabelSize::XSmall))
+            .child(Label::new(label.to_string()).size(LabelSize::Default))
             .child(
                 div().px_1().rounded_sm().bg(gpui::rgb(0x2a2a3a)).child(
-                    Label::new(badge_owned).size(LabelSize::XSmall).color(Color::Accent),
+                    Label::new(badge_owned).size(LabelSize::Default).color(Color::Accent),
                 ),
             )
     }
@@ -1284,17 +1284,17 @@ impl DatabasePanel {
             .pr_2()
             .py_px()
             .child(Icon::new(IconName::Dash).size(IconSize::XSmall).color(Color::Muted))
-            .child(Label::new(col.name.clone()).size(LabelSize::XSmall))
+            .child(Label::new(col.name.clone()).size(LabelSize::Default))
             .child(
                 Label::new(col.data_type.clone())
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Default)
                     .color(Color::Muted),
             );
 
         for badge in badges {
             row = row.child(
                 div().px_1().rounded_sm().bg(gpui::rgb(0x2a2a3a)).child(
-                    Label::new(badge).size(LabelSize::XSmall).color(Color::Accent),
+                    Label::new(badge).size(LabelSize::Default).color(Color::Accent),
                 ),
             );
         }
@@ -1339,8 +1339,8 @@ impl DatabasePanel {
             .gap_3()
             .p_4()
             .child(Icon::new(IconName::DatabaseZap).size(IconSize::Medium).color(Color::Muted))
-            .child(Label::new("No connections").size(LabelSize::Small).color(Color::Muted))
-            .child(Label::new("Add a connection to get started").size(LabelSize::XSmall).color(Color::Muted))
+            .child(Label::new("No connections").size(LabelSize::Default).color(Color::Muted))
+            .child(Label::new("Add a connection to get started").size(LabelSize::Default).color(Color::Muted))
             .child(buttons)
             .into_any_element()
     }
@@ -1382,7 +1382,7 @@ impl DatabasePanel {
                     .child(
                         div().flex().items_center().gap_2()
                             .child(Icon::new(title_icon).size(IconSize::Small).color(Color::Accent))
-                            .child(Label::new(title).size(LabelSize::Small).weight(FontWeight::SEMIBOLD)),
+                            .child(Label::new(title).size(LabelSize::Default).weight(FontWeight::SEMIBOLD)),
                     )
                     // Provider badge
                     .child(
@@ -1401,7 +1401,7 @@ impl DatabasePanel {
                             )
                             .child(
                                 Label::new(provider_display_name)
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Default)
                                     .weight(FontWeight::SEMIBOLD),
                             )
                     )
@@ -1421,7 +1421,7 @@ impl DatabasePanel {
                     })
                     // Error / test status messages
                     .when_some(form.error_message.clone(), |d, msg| {
-                        d.child(Label::new(msg).size(LabelSize::XSmall).color(Color::Error))
+                        d.child(Label::new(msg).size(LabelSize::Default).color(Color::Error))
                     })
                     .when_some(form.test_status.clone(), |d, status| {
                         d.child(match status {
@@ -1430,21 +1430,21 @@ impl DatabasePanel {
                                 .items_center()
                                 .gap_1()
                                 .child(Icon::new(IconName::ArrowCircle).size(IconSize::XSmall).color(Color::Warning))
-                                .child(Label::new("Testing connection...").size(LabelSize::XSmall).color(Color::Warning))
+                                .child(Label::new("Testing connection...").size(LabelSize::Default).color(Color::Warning))
                                 .into_any_element(),
                             TestStatus::Success => div()
                                 .flex()
                                 .items_center()
                                 .gap_1()
                                 .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Success))
-                                .child(Label::new("Connection successful!").size(LabelSize::XSmall).color(Color::Success))
+                                .child(Label::new("Connection successful!").size(LabelSize::Default).color(Color::Success))
                                 .into_any_element(),
                             TestStatus::Failed(msg) => div()
                                 .flex()
                                 .items_center()
                                 .gap_1()
                                 .child(Icon::new(IconName::Close).size(IconSize::XSmall).color(Color::Error))
-                                .child(Label::new(msg).size(LabelSize::XSmall).color(Color::Error))
+                                .child(Label::new(msg).size(LabelSize::Default).color(Color::Error))
                                 .into_any_element(),
                         })
                     })
@@ -1488,7 +1488,7 @@ impl DatabasePanel {
             .flex_col()
             .gap_px()
             .w_full()
-            .child(Label::new("Database File").size(LabelSize::XSmall).color(Color::Muted))
+            .child(Label::new("Database File").size(LabelSize::Default).color(Color::Muted))
             .child(
                 div()
                     .flex()
@@ -1508,7 +1508,7 @@ impl DatabasePanel {
                     .child(
                         Button::new("browse_db", "Browse")
                             .style(ButtonStyle::Subtle)
-                            .label_size(LabelSize::XSmall)
+                            .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.browse_sqlite_file(window, cx);
                             })),
@@ -1553,7 +1553,7 @@ impl DatabasePanel {
             .flex_col()
             .gap_px()
             .w_full()
-            .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+            .child(Label::new(label).size(LabelSize::Default).color(Color::Muted))
             .child(
                 div()
                     .w_full()
