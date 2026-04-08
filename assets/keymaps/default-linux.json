@@ -659,6 +659,7 @@
       "ctrl-shift-b": "outline_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",
       "ctrl-shift-d": "debug_panel::ToggleFocus",
+      "ctrl-shift-;": "database_panel::ToggleFocus",
       "ctrl-?": "agent::ToggleFocus",
       "alt-save": "workspace::SaveAll",
       "ctrl-alt-s": "workspace::SaveAll",
@@ -1507,4 +1508,24 @@
       "alt-3": "git_picker::ActivateStashTab",
     },
   },
+  {
+    "context": "DatabasePanel",
+    "bindings": {
+      "escape": "database_panel::Close"
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-alt-r": "database_panel::RunQuery",
+      "ctrl-alt-e": "database_panel::ExplainQuery"
+    }
+  },
+  {
+    "context": "DatabaseConnectionForm",
+    "bindings": {
+      "tab": "database_panel::FocusNextField",
+      "shift-tab": "database_panel::FocusPrevField"
+    }
+  }
 ]

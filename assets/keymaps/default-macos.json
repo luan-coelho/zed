@@ -719,6 +719,7 @@
       "cmd-shift-b": "outline_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",
       "cmd-shift-d": "debug_panel::ToggleFocus",
+      "cmd-shift-;": "database_panel::ToggleFocus",
       "cmd-?": "agent::ToggleFocus",
       "cmd-alt-s": "workspace::SaveAll",
       "cmd-k n": "encoding_selector::Toggle",
@@ -1607,4 +1608,24 @@
       "escape": "notebook::EnterCommandMode",
     },
   },
+  {
+    "context": "DatabasePanel",
+    "bindings": {
+      "escape": "database_panel::Close"
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "cmd-alt-r": "database_panel::RunQuery",
+      "cmd-alt-e": "database_panel::ExplainQuery"
+    }
+  },
+  {
+    "context": "DatabaseConnectionForm",
+    "bindings": {
+      "tab": "database_panel::FocusNextField",
+      "shift-tab": "database_panel::FocusPrevField"
+    }
+  }
 ]

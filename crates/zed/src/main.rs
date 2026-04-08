@@ -742,6 +742,7 @@ fn main() {
         call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         collab_ui::init(&app_state, cx);
+        database_ui::init(cx);
         git_ui::init(cx);
         git_graph::init(cx);
         feedback::init(cx);
