@@ -143,6 +143,13 @@ pub trait DatabaseProvider: Send + Sync {
         ))
     }
 
+    async fn create_user(&self, _url: &str, _name: &str) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "{}: create_user not supported",
+            self.metadata().id()
+        ))
+    }
+
     async fn begin_transaction(&self, _url: &str, _isolation: Option<&str>) -> Result<()> {
         Err(anyhow::anyhow!(
             "{}: transactions not supported",

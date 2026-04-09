@@ -261,6 +261,11 @@ impl ConnectionManager {
         ctx.provider.create_role(&ctx.url, name).await
     }
 
+    pub async fn create_user(&mut self, name: &str) -> Result<()> {
+        let ctx = self.active_context()?;
+        ctx.provider.create_user(&ctx.url, name).await
+    }
+
     pub async fn begin_transaction(&mut self, isolation: Option<&str>) -> Result<()> {
         let ctx = self.active_context()?;
         ctx.provider.begin_transaction(&ctx.url, isolation).await

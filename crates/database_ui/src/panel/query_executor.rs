@@ -238,6 +238,7 @@ impl DatabasePanel {
             let editor = cx.new(|cx| {
                 let mut editor =
                     Editor::for_buffer(buffer.clone(), Some(project), window, cx);
+                editor.set_should_serialize(false, cx);
                 editor.buffer().update(cx, |mb, cx| {
                     mb.set_title(console_title.clone(), cx);
                 });
@@ -248,9 +249,10 @@ impl DatabasePanel {
 
             // Subscribe to buffer edits for SQL diagnostics
             let diag_buffer = buffer.clone();
+            let diag_schema = self.active_schema_for_completions.clone();
             cx.subscribe(&buffer, move |_workspace, _buf, event, cx| {
                 if matches!(event, language::BufferEvent::Edited { .. }) {
-                    crate::sql_diagnostics::update_sql_diagnostics(&diag_buffer, &provider_id, cx);
+                    crate::sql_diagnostics::update_sql_diagnostics(&diag_buffer, &provider_id, &diag_schema, cx);
                 }
             })
             .detach();
@@ -392,6 +394,7 @@ impl DatabasePanel {
                     break;
                 }
 
+                let is_tx_command = detect_transaction_command(stmt).is_some();
                 let tx_cmd = detect_transaction_command(stmt);
 
                 let result = Self::execute_statement(
@@ -436,7 +439,11 @@ impl DatabasePanel {
                     .first()
                     .is_some_and(|c| c == "Error");
 
-                Self::push_query_result(&weak_workspace, stmt.clone(), query_result, cx);
+                if is_tx_command {
+                    Self::push_output_only(&weak_workspace, stmt.clone(), query_result, cx);
+                } else {
+                    Self::push_query_result(&weak_workspace, stmt.clone(), query_result, cx);
+                }
 
                 // Update in_transaction state
                 let conn_mgr_check = conn_manager.clone();
@@ -713,6 +720,57 @@ impl DatabasePanel {
         .await
     }
 
+    /// Execute a provider-level administrative operation, bypassing the query editor's
+    /// transaction state. After completion, refreshes the tree and shows the result.
+    pub(crate) fn run_admin_operation<F>(
+        &mut self,
+        label: String,
+        operation: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    )
+    where
+        F: FnOnce(&mut ConnectionManager) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> + Send + 'static,
+    {
+        let conn_manager = self.connection_manager.clone();
+        let weak_workspace = self._workspace.clone();
+
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let conn_mgr = conn_manager.clone();
+            let label_clone = label.clone();
+
+            let result = Tokio::spawn_result(cx, async move {
+                let mut mgr = conn_mgr.write().await;
+                operation(&mut mgr).await
+            })
+            .await;
+
+            let query_result = match result {
+                Ok(()) => database_core::QueryResult {
+                    columns: vec!["status".to_string()],
+                    rows: vec![vec!["OK".to_string()]],
+                    rows_affected: 0,
+                    execution_time_ms: 0,
+                },
+                Err(e) => database_core::QueryResult {
+                    columns: vec!["Error".to_string()],
+                    rows: vec![vec![format!("{e:#}")]],
+                    rows_affected: 0,
+                    execution_time_ms: 0,
+                },
+            };
+
+            Self::push_output_only(&weak_workspace, label_clone, query_result, cx);
+
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(conn_name) = this.active_query_connection.clone() {
+                    this.connect(&conn_name, window, cx);
+                }
+            });
+        });
+        self._pending_task = Some(task);
+    }
+
     /// Push a query result to the result panel.
     pub(crate) fn push_query_result(
         weak_workspace: &WeakEntity<Workspace>,
@@ -727,6 +785,24 @@ impl DatabasePanel {
                         panel.push_result(label, result, cx);
                     });
                     workspace.open_panel::<DatabaseResultPanel>(window, cx);
+                }
+            });
+        }
+    }
+
+    /// Push a result that only appears in the output log, without creating a tab.
+    pub(crate) fn push_output_only(
+        weak_workspace: &WeakEntity<Workspace>,
+        label: String,
+        result: database_core::QueryResult,
+        cx: &mut AsyncWindowContext,
+    ) {
+        if let Some(ws) = weak_workspace.upgrade() {
+            let _ = ws.update_in(cx, |workspace, _window, cx| {
+                if let Some(result_panel) = workspace.panel::<DatabaseResultPanel>(cx) {
+                    result_panel.update(cx, |panel, cx| {
+                        panel.push_output_result(label, result, cx);
+                    });
                 }
             });
         }

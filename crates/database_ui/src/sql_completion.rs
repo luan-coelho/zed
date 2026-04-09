@@ -472,7 +472,7 @@ pub(crate) fn parse_aliases(text: &str) -> std::collections::HashMap<String, Str
             if table_idx >= tokens.len() {
                 break;
             }
-            let table_name = tokens[table_idx];
+            let table_name = tokens[table_idx].trim_matches(|c| c == '\'' || c == '"' || c == '`');
 
             // Skip if table_name looks like a keyword or subquery
             if table_name.starts_with('(') || upper_tokens[table_idx] == "SELECT" {

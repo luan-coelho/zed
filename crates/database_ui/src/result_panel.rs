@@ -8,7 +8,7 @@ use gpui::{
 };
 use theme::ActiveTheme;
 use ui::ContextMenu;
-use ui::{prelude::*, TintColor, Tooltip};
+use ui::{prelude::*, Tooltip};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::Workspace;
 
@@ -142,6 +142,7 @@ enum ResultView {
 
 pub struct DatabaseResultPanel {
     focus_handle: FocusHandle,
+    _workspace: WeakEntity<Workspace>,
     results: Vec<QueryResultEntry>,
     active_view: ResultView,
     selected_row: Option<usize>,
@@ -155,6 +156,10 @@ pub struct DatabaseResultPanel {
     editing_cell: Option<(usize, usize)>,
     cell_editor: Entity<Editor>,
     pending_updates: Vec<String>,
+    /// Maps (result_index, row, col) to the original cell value before editing.
+    original_values: std::collections::HashMap<(usize, usize, usize), String>,
+    tx_menu: Option<(Entity<ContextMenu>, Subscription)>,
+    _pending_task: Option<gpui::Task<()>>,
 }
 
 struct QueryResultEntry {
@@ -174,7 +179,7 @@ struct HistoryEntry {
 }
 
 impl DatabaseResultPanel {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
 
         let filter_editor = cx.new(|cx| {
@@ -195,6 +200,7 @@ impl DatabaseResultPanel {
 
         Self {
             focus_handle,
+            _workspace: workspace,
             results: Vec::new(),
             active_view: ResultView::Output,
             selected_row: None,
@@ -208,6 +214,9 @@ impl DatabaseResultPanel {
             editing_cell: None,
             cell_editor,
             pending_updates: Vec::new(),
+            original_values: std::collections::HashMap::new(),
+            tx_menu: None,
+            _pending_task: None,
         }
     }
 
@@ -215,46 +224,41 @@ impl DatabaseResultPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
-        workspace.update_in(&mut cx, |_workspace, window, cx| {
-            cx.new(|cx| DatabaseResultPanel::new(window, cx))
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let weak = workspace.weak_handle();
+            cx.new(|cx| DatabaseResultPanel::new(weak, window, cx))
         })
     }
 
     pub fn push_result(&mut self, query: String, result: QueryResult, cx: &mut Context<Self>) {
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
 
-        // Append to output log
-        let is_error = result.columns.first().is_some_and(|c| c == "Error");
-        let query_preview = if query.len() > 80 {
-            format!("{}...", &query[..77])
-        } else {
-            query.clone()
-        };
-        self.output_log
-            .push(format!("[{}] > {}", now, query_preview));
-        if is_error {
-            let msg = result
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .cloned()
-                .unwrap_or_default();
-            self.output_log
-                .push(format!("[{}] ERROR: {}", now, msg));
-        } else {
-            self.output_log.push(format!(
-                "[{}] {} rows · {}ms",
-                now, result.rows_affected, result.execution_time_ms
-            ));
-        }
+        self.log_result(&now, &query, &result);
 
         self.history.push(HistoryEntry {
             query: query.clone(),
             timestamp: now.clone(),
-            success: !is_error,
+            success: !result.columns.first().is_some_and(|c| c == "Error"),
             rows_affected: result.rows_affected,
             execution_time_ms: result.execution_time_ms,
         });
+
+        // Check if an existing tab has the same query — if so, update it in-place
+        if let Some(idx) = self.results.iter().position(|e| e.query == query) {
+            self.results[idx].result = result;
+            self.results[idx].page = 0;
+            self.results[idx].timestamp = now;
+            self.active_view = ResultView::Table(idx);
+            self.selected_row = None;
+            self.sort_column = None;
+            self.sort_ascending = true;
+            self.editing_cell = None;
+            self.pending_updates.clear();
+            self.original_values.clear();
+            cx.emit(PanelEvent::Activate);
+            cx.notify();
+            return;
+        }
 
         self.results.push(QueryResultEntry {
             query,
@@ -269,6 +273,49 @@ impl DatabaseResultPanel {
         self.sort_ascending = true;
         cx.emit(PanelEvent::Activate);
         cx.notify();
+    }
+
+    /// Push a result that should only appear in the output log, not as a tab.
+    /// Used for transaction control (BEGIN/COMMIT/ROLLBACK) and admin operations.
+    pub fn push_output_result(&mut self, query: String, result: QueryResult, cx: &mut Context<Self>) {
+        let now = chrono::Local::now().format("%H:%M:%S").to_string();
+
+        self.log_result(&now, &query, &result);
+
+        self.history.push(HistoryEntry {
+            query,
+            timestamp: now,
+            success: !result.columns.first().is_some_and(|c| c == "Error"),
+            rows_affected: result.rows_affected,
+            execution_time_ms: result.execution_time_ms,
+        });
+
+        cx.notify();
+    }
+
+    fn log_result(&mut self, now: &str, query: &str, result: &QueryResult) {
+        let is_error = result.columns.first().is_some_and(|c| c == "Error");
+        let query_preview = if query.len() > 80 {
+            format!("{}...", &query[..77])
+        } else {
+            query.to_string()
+        };
+        self.output_log
+            .push(format!("[{now}] > {query_preview}"));
+        if is_error {
+            let msg = result
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .cloned()
+                .unwrap_or_default();
+            self.output_log.push(format!("[{now}] ERROR: {msg}"));
+        } else {
+            self.output_log.push(format!(
+                "[{now}] {} rows · {}ms",
+                result.rows_affected, result.execution_time_ms
+            ));
+        }
     }
 
     /// Append a log message to the output (e.g., connection events).
@@ -288,6 +335,111 @@ impl DatabaseResultPanel {
         match self.active_view {
             ResultView::Table(idx) => self.results.get(idx).map(|e| &e.result),
             ResultView::Output | ResultView::History => None,
+        }
+    }
+
+    fn tx_label(&self, cx: &gpui::App) -> Option<(String, bool)> {
+        let ws = self._workspace.upgrade()?;
+        let panel = ws.read(cx).panel::<crate::DatabasePanel>(cx)?;
+        let panel_ref = panel.read(cx);
+        let mode_label = match panel_ref.transaction_mode {
+            crate::database_panel::TransactionMode::Auto => "Auto",
+            crate::database_panel::TransactionMode::Manual => "Manual",
+        };
+        Some((format!("Tx: {mode_label}"), panel_ref.in_transaction))
+    }
+
+    fn deploy_tx_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self._workspace.upgrade() else { return };
+        let Some(panel) = ws.read(cx).panel::<crate::DatabasePanel>(cx) else { return };
+        let panel_ref = panel.read(cx);
+
+        let current_mode = panel_ref.transaction_mode;
+        let current_isolation = panel_ref.isolation_level;
+        let panel_entity = panel.clone();
+
+        use crate::database_panel::{IsolationLevel, TransactionMode};
+
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            menu = menu.header("Transaction Mode");
+
+            let modes = [
+                (TransactionMode::Auto, "Auto"),
+                (TransactionMode::Manual, "Manual"),
+            ];
+            for (mode, label) in modes {
+                let is_active = mode == current_mode;
+                let panel = panel_entity.clone();
+                let display = if is_active {
+                    format!("\u{2713} {label}")
+                } else {
+                    format!("  {label}")
+                };
+                menu = menu.entry(display, None, move |_window, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_transaction_mode(mode, cx);
+                    });
+                });
+            }
+
+            menu = menu.separator();
+            menu = menu.header("Transaction Isolation");
+
+            let levels = [
+                IsolationLevel::DatabaseDefault,
+                IsolationLevel::ReadCommitted,
+                IsolationLevel::RepeatableRead,
+                IsolationLevel::Serializable,
+            ];
+            for level in levels {
+                let is_active = level == current_isolation;
+                let panel = panel_entity.clone();
+                let label = level.label();
+                let display = if is_active {
+                    format!("\u{2713} {label}")
+                } else {
+                    format!("  {label}")
+                };
+                menu = menu.entry(display, None, move |_window, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_isolation_level(level, cx);
+                    });
+                });
+            }
+
+            menu
+        });
+
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, _cx| {
+            this.tx_menu.take();
+        });
+        self.tx_menu = Some((menu, subscription));
+        cx.notify();
+    }
+
+    fn rerun_active_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = match self.active_view {
+            ResultView::Table(idx) => self.results.get(idx).map(|e| e.query.clone()),
+            _ => None,
+        };
+        let Some(query) = query else { return };
+
+        let now = chrono::Local::now().format("%H:%M:%S").to_string();
+        let preview = if query.len() > 80 {
+            format!("{}...", &query[..77])
+        } else {
+            query.clone()
+        };
+        self.output_log.push(format!("[{now}] Re-running: {preview}"));
+
+        if let Some(workspace) = self._workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                if let Some(panel) = workspace.panel::<crate::DatabasePanel>(cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.run_sql(query, window, cx);
+                    });
+                }
+            });
         }
     }
 
@@ -358,6 +510,9 @@ impl DatabaseResultPanel {
 
         if let Some(row_data) = entry.result.rows.get_mut(row) {
             if let Some(cell) = row_data.get_mut(col) {
+                self.original_values
+                    .entry((active_idx, row, col))
+                    .or_insert_with(|| old_value);
                 *cell = new_value;
             }
         }
@@ -372,9 +527,93 @@ impl DatabaseResultPanel {
         cx.notify();
     }
 
+    fn apply_pending_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_updates.is_empty() {
+            return;
+        }
+
+        let statements = std::mem::take(&mut self.pending_updates);
+        self.original_values.clear();
+        let count = statements.len();
+
+        let now = chrono::Local::now().format("%H:%M:%S").to_string();
+        self.output_log
+            .push(format!("[{now}] Executing {count} UPDATE statement(s)"));
+        cx.notify();
+
+        let Some(workspace) = self._workspace.upgrade() else { return };
+        let Some(panel) = workspace.read(cx).panel::<crate::DatabasePanel>(cx) else { return };
+        let conn_manager = panel.read(cx).connection_manager.clone();
+        let database = panel.read(cx).active_query_database.clone();
+        let schema = panel.read(cx).active_schema.clone();
+        let weak_self = cx.entity().downgrade();
+
+        let task = cx.spawn_in(window, async move |_this, cx| {
+            for stmt in &statements {
+                let conn_mgr = conn_manager.clone();
+                let stmt_owned = stmt.clone();
+                let db = database.clone();
+                let sch = schema.clone();
+
+                let result = gpui_tokio::Tokio::spawn_result(cx, async move {
+                    let mut mgr = conn_mgr.write().await;
+                    match db {
+                        Some(ref db) => {
+                            mgr.execute_query_in_database(&stmt_owned, db, sch.as_deref()).await
+                        }
+                        None => {
+                            mgr.execute_query_in_schema(&stmt_owned, sch.as_deref()).await
+                        }
+                    }
+                })
+                .await;
+
+                let _ = weak_self.update_in(cx, |this, _window, cx| {
+                    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                    match &result {
+                        Ok(qr) => {
+                            this.output_log.push(format!(
+                                "[{now}] > {stmt}"
+                            ));
+                            this.output_log.push(format!(
+                                "[{now}] {} row(s) affected · {}ms",
+                                qr.rows_affected, qr.execution_time_ms
+                            ));
+                        }
+                        Err(e) => {
+                            this.output_log.push(format!(
+                                "[{now}] > {stmt}"
+                            ));
+                            this.output_log.push(format!(
+                                "[{now}] ERROR: {e:#}"
+                            ));
+                        }
+                    }
+                    cx.notify();
+                });
+
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+        self._pending_task = Some(task);
+    }
+
     fn discard_pending_updates(&mut self, cx: &mut Context<Self>) {
         let count = self.pending_updates.len();
         self.pending_updates.clear();
+
+        for ((result_idx, row, col), original) in self.original_values.drain() {
+            if let Some(entry) = self.results.get_mut(result_idx) {
+                if let Some(row_data) = entry.result.rows.get_mut(row) {
+                    if let Some(cell) = row_data.get_mut(col) {
+                        *cell = original;
+                    }
+                }
+            }
+        }
+
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
         self.output_log
             .push(format!("[{now}] Discarded {count} pending update(s)"));
@@ -979,14 +1218,7 @@ impl DatabaseResultPanel {
                 .into_any_element();
         }
 
-        let num_cols = result.columns.len();
-        let col_width = if num_cols <= 3 {
-            px(180.)
-        } else if num_cols <= 6 {
-            px(140.)
-        } else {
-            px(110.)
-        };
+        let _num_cols = result.columns.len();
 
         // Sort rows if a sort column is set
         let sorted_rows = if let Some(sort_col) = self.sort_column {
@@ -1060,8 +1292,9 @@ impl DatabaseResultPanel {
                     header = header.child(
                         div()
                             .id(ElementId::Name(format!("col-header-{col_idx}").into()))
-                            .w(col_width)
-                            .flex_shrink_0()
+                            .flex_1()
+                            .min_w(px(60.))
+                            .overflow_hidden()
                             .px_2()
                             .py_1()
                             .cursor_pointer()
@@ -1081,8 +1314,11 @@ impl DatabaseResultPanel {
                                 ));
                                 cx.notify();
                             }))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .child(
                                 Label::new(format!("{col}{sort_indicator}"))
+                                    .single_line()
                                     .size(LabelSize::XSmall)
                                     .weight(FontWeight::SEMIBOLD),
                             ),
@@ -1134,13 +1370,46 @@ impl DatabaseResultPanel {
                                     let is_editing = editing_cell == Some((global_ix, col_idx));
 
                                     if is_editing {
+                                        let weak_confirm = weak_self.clone();
+                                        let weak_cancel = weak_self.clone();
                                         row = row.child(
                                             div()
-                                                .w(col_width)
-                                                .flex_shrink_0()
+                                                .flex()
+                                                .items_center()
+                                                .flex_1()
+                                                .min_w(px(60.))
+                                                .overflow_hidden()
                                                 .px_1()
                                                 .py_px()
-                                                .child(cell_editor.clone()),
+                                                .child(
+                                                    div().flex_1().child(cell_editor.clone()),
+                                                )
+                                                .child(
+                                                    IconButton::new("cell-confirm", IconName::Check)
+                                                        .icon_size(IconSize::XSmall)
+                                                        .icon_color(Color::Success)
+                                                        .tooltip(|_w, cx| Tooltip::simple("Confirm edit (Enter)", cx))
+                                                        .on_click(move |_, window, cx| {
+                                                            if let Some(panel) = weak_confirm.upgrade() {
+                                                                panel.update(cx, |this, cx| {
+                                                                    this.commit_cell_edit(window, cx);
+                                                                });
+                                                            }
+                                                        }),
+                                                )
+                                                .child(
+                                                    IconButton::new("cell-cancel", IconName::Close)
+                                                        .icon_size(IconSize::XSmall)
+                                                        .icon_color(Color::Error)
+                                                        .tooltip(|_w, cx| Tooltip::simple("Cancel edit (Escape)", cx))
+                                                        .on_click(move |_, window, cx| {
+                                                            if let Some(panel) = weak_cancel.upgrade() {
+                                                                panel.update(cx, |this, cx| {
+                                                                    this.cancel_cell_edit(window, cx);
+                                                                });
+                                                            }
+                                                        }),
+                                                ),
                                         );
                                     } else {
                                         let is_null = val == "NULL";
@@ -1157,8 +1426,8 @@ impl DatabaseResultPanel {
                                                 .id(ElementId::Name(
                                                     format!("cell-{global_ix}-{col_idx}").into(),
                                                 ))
-                                                .w(col_width)
-                                                .flex_shrink_0()
+                                                .flex_1()
+                                                .min_w(px(60.))
                                                 .px_2()
                                                 .py_px()
                                                 .overflow_hidden()
@@ -1169,18 +1438,27 @@ impl DatabaseResultPanel {
                                                     move |_w, cx| Tooltip::simple(v.clone(), cx)
                                                 })
                                                 .on_click({
-                                                    move |_, window, cx| {
-                                                        if let Some(panel) = weak.upgrade() {
-                                                            panel.update(cx, |this, cx| {
-                                                                this.start_editing_cell(
-                                                                    global_ix, col_idx, window, cx,
-                                                                );
-                                                            });
+                                                    move |event, window, cx| {
+                                                        let is_double_click = match event {
+                                                            gpui::ClickEvent::Mouse(m) => m.down.click_count >= 2,
+                                                            gpui::ClickEvent::Keyboard(_) => false,
+                                                        };
+                                                        if is_double_click {
+                                                            if let Some(panel) = weak.upgrade() {
+                                                                panel.update(cx, |this, cx| {
+                                                                    this.start_editing_cell(
+                                                                        global_ix, col_idx, window, cx,
+                                                                    );
+                                                                });
+                                                            }
                                                         }
                                                     }
                                                 })
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
                                                 .child(
                                                     Label::new(val.clone())
+                                                        .single_line()
                                                         .size(LabelSize::XSmall)
                                                         .color(if is_error {
                                                             Color::Error
@@ -1365,76 +1643,6 @@ impl DatabaseResultPanel {
                             ),
                     ),
             )
-            .when(!self.pending_updates.is_empty(), |d| {
-                let count = self.pending_updates.len();
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px_2()
-                        .py_1()
-                        .border_t_1()
-                        .border_color(cx.theme().colors().border)
-                        .bg(cx.theme().colors().title_bar_background)
-                        .child(
-                            Label::new(format!(
-                                "{} pending change{}",
-                                count,
-                                if count == 1 { "" } else { "s" }
-                            ))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Warning),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    Button::new("apply-updates", "Apply")
-                                        .style(ButtonStyle::Tinted(TintColor::Accent))
-                                        .label_size(LabelSize::XSmall)
-                                        .tooltip(|_w, cx| {
-                                            Tooltip::simple(
-                                                "Copy all pending UPDATE statements to clipboard",
-                                                cx,
-                                            )
-                                        })
-                                        .on_click(cx.listener(|this, _, _w, cx| {
-                                            let sql =
-                                                this.pending_updates.join("\n");
-                                            cx.write_to_clipboard(
-                                                gpui::ClipboardItem::new_string(sql),
-                                            );
-                                            let count = this.pending_updates.len();
-                                            this.pending_updates.clear();
-                                            let now = chrono::Local::now()
-                                                .format("%H:%M:%S")
-                                                .to_string();
-                                            this.output_log.push(format!(
-                                                "[{now}] Copied {count} UPDATE statement(s) to clipboard"
-                                            ));
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("discard-updates", "Discard")
-                                        .style(ButtonStyle::Subtle)
-                                        .label_size(LabelSize::XSmall)
-                                        .tooltip(|_w, cx| {
-                                            Tooltip::simple(
-                                                "Discard all pending changes",
-                                                cx,
-                                            )
-                                        })
-                                        .on_click(cx.listener(|this, _, _w, cx| {
-                                            this.discard_pending_updates(cx);
-                                        })),
-                                ),
-                        ),
-                )
-            })
             .into_any_element()
     }
 
@@ -1539,6 +1747,83 @@ impl Render for DatabaseResultPanel {
                     .border_color(cx.theme().colors().border)
                     .child(self.render_tab_bar(cx))
                     .child(div().flex_1())
+                    // Transaction mode selector
+                    .when_some(self.tx_label(cx), |d, (tx_label, in_tx)| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new("result-tx-selector", tx_label)
+                                        .label_size(LabelSize::XSmall)
+                                        .style(ButtonStyle::Subtle)
+                                        .color(if in_tx { Color::Warning } else { Color::Default })
+                                        .end_icon(
+                                            Icon::new(IconName::ChevronDown)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.deploy_tx_menu(window, cx);
+                                        })),
+                                )
+                                .when(in_tx, |d| {
+                                    d.child(
+                                        Label::new("In Tx")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Warning),
+                                    )
+                                    .child(
+                                        IconButton::new("result-tx-commit", IconName::Check)
+                                            .icon_size(IconSize::XSmall)
+                                            .icon_color(Color::Success)
+                                            .tooltip(|_w, cx| Tooltip::simple("Commit Transaction", cx))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.apply_pending_updates(window, cx);
+                                                if let Some(ws) = this._workspace.upgrade() {
+                                                    ws.update(cx, |workspace, cx| {
+                                                        if let Some(panel) = workspace.panel::<crate::DatabasePanel>(cx) {
+                                                            panel.update(cx, |panel, cx| {
+                                                                panel.run_sql("COMMIT;".into(), window, cx);
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                            })),
+                                    )
+                                    .child(
+                                        IconButton::new("result-tx-rollback", IconName::Close)
+                                            .icon_size(IconSize::XSmall)
+                                            .icon_color(Color::Error)
+                                            .tooltip(|_w, cx| Tooltip::simple("Rollback Transaction", cx))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.discard_pending_updates(cx);
+                                                if let Some(ws) = this._workspace.upgrade() {
+                                                    ws.update(cx, |workspace, cx| {
+                                                        if let Some(panel) = workspace.panel::<crate::DatabasePanel>(cx) {
+                                                            panel.update(cx, |panel, cx| {
+                                                                panel.run_sql("ROLLBACK;".into(), window, cx);
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                            })),
+                                    )
+                                }),
+                        )
+                    })
+                    .when(matches!(self.active_view, ResultView::Table(_)), |d| {
+                        d.child(
+                            IconButton::new("rerun-query", IconName::Rerun)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(|_w, cx| Tooltip::simple("Re-run query", cx))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.rerun_active_query(window, cx);
+                                })),
+                        )
+                    })
                     .when(!self.results.is_empty(), |d| {
                         d.child(
                             IconButton::new("close-all-tabs", IconName::ListTree)
@@ -1575,6 +1860,16 @@ impl Render for DatabaseResultPanel {
                             .child(menu.clone()),
                     )
                     .with_priority(1),
+                )
+            })
+            .when_some(self.tx_menu.as_ref(), |d, (menu, _)| {
+                d.child(
+                    deferred(
+                        anchored()
+                            .anchor(Corner::TopRight)
+                            .child(menu.clone()),
+                    )
+                    .with_priority(2),
                 )
             })
     }

@@ -90,7 +90,12 @@ impl DatabasePanel {
             port_editor: make_editor(cx, window, default_port, &port_val),
             database_editor: make_editor(cx, window, db_placeholder, &db_val),
             user_editor: make_editor(cx, window, default_user, &user_val),
-            password_editor: make_editor(cx, window, "stored in OS keychain", ""),
+            password_editor: cx.new(|cx| {
+                let mut e = Editor::single_line(window, cx);
+                e.set_placeholder_text("stored in OS keychain", window, cx);
+                e.set_masked(true, cx);
+                e
+            }),
             provider: provider_val,
             scope,
             editing,

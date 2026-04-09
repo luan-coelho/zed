@@ -206,7 +206,12 @@ impl DatabasePanel {
                                     move |window, cx| {
                                         if let Some(panel) = w.upgrade() {
                                             panel.update(cx, |this, cx| {
-                                                this.run_sql("CREATE DATABASE new_database_name;".into(), window, cx);
+                                                this.run_admin_operation(
+                                                    "CREATE DATABASE new_database_name".into(),
+                                                    |mgr| Box::pin(mgr.create_database("new_database_name")),
+                                                    window,
+                                                    cx,
+                                                );
                                             });
                                         }
                                     }
@@ -218,7 +223,12 @@ impl DatabasePanel {
                                     move |window, cx| {
                                         if let Some(panel) = w.upgrade() {
                                             panel.update(cx, |this, cx| {
-                                                this.run_sql("CREATE SCHEMA new_schema_name;".into(), window, cx);
+                                                this.run_admin_operation(
+                                                    "CREATE SCHEMA new_schema_name".into(),
+                                                    |mgr| Box::pin(mgr.create_schema("new_schema_name")),
+                                                    window,
+                                                    cx,
+                                                );
                                             });
                                         }
                                     }
@@ -230,7 +240,12 @@ impl DatabasePanel {
                                     move |window, cx| {
                                         if let Some(panel) = w.upgrade() {
                                             panel.update(cx, |this, cx| {
-                                                this.run_sql("CREATE ROLE new_role_name LOGIN;".into(), window, cx);
+                                                this.run_admin_operation(
+                                                    "CREATE ROLE new_role_name".into(),
+                                                    |mgr| Box::pin(mgr.create_role("new_role_name")),
+                                                    window,
+                                                    cx,
+                                                );
                                             });
                                         }
                                     }
@@ -242,7 +257,12 @@ impl DatabasePanel {
                                     move |window, cx| {
                                         if let Some(panel) = w.upgrade() {
                                             panel.update(cx, |this, cx| {
-                                                this.run_sql("CREATE USER 'new_user'@'%' IDENTIFIED BY 'password';".into(), window, cx);
+                                                this.run_admin_operation(
+                                                    "CREATE USER new_user".into(),
+                                                    |mgr| Box::pin(mgr.create_user("new_user")),
+                                                    window,
+                                                    cx,
+                                                );
                                             });
                                         }
                                     }
@@ -544,7 +564,12 @@ impl DatabasePanel {
                         move |window, cx| {
                             if let Some(panel) = w.upgrade() {
                                 panel.update(cx, |this, cx| {
-                                    this.run_sql("CREATE SCHEMA new_schema_name;".into(), window, cx);
+                                    this.run_admin_operation(
+                                        "CREATE SCHEMA new_schema_name".into(),
+                                        |mgr| Box::pin(mgr.create_schema("new_schema_name")),
+                                        window,
+                                        cx,
+                                    );
                                 });
                             }
                         }

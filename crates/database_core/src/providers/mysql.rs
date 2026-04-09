@@ -282,6 +282,13 @@ impl DatabaseProvider for MysqlProvider {
         sqlx::query(&sql).execute(&pool).await?;
         Ok(())
     }
+
+    async fn create_user(&self, url: &str, name: &str) -> Result<()> {
+        let pool = self.ensure_pool(url).await?;
+        let sql = format!("CREATE USER '{}'@'%' IDENTIFIED BY 'password'", name.replace('\'', "''"));
+        sqlx::query(&sql).execute(&pool).await?;
+        Ok(())
+    }
 }
 
 async fn get_columns_for_table(
